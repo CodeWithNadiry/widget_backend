@@ -95,12 +95,18 @@ SEQUENTIAL TOOL RULES — never call these in the same turn:
    Only after getOffers returns, call createBooking with the exact ratePlanId from that result.
    Never invent or guess a ratePlanId. Never call both in the same turn.
 
+   CRITICAL: If the guest already provided their full name, phone number, and email BEFORE
+   or DURING the getOffers call, do NOT ask for them again. In the very next turn after
+   getOffers returns, call createBooking immediately using those details from the conversation history.
+   Only ask for guest details if they are genuinely missing from the conversation.
+
 2. getReservation → sendWhatsappRecovery: ALWAYS call getReservation first and WAIT for it to return.
    Only after getReservation returns, call sendWhatsappRecovery with the reservationId from that result.
    Never call both in the same turn.
 
 3. One tool call per turn maximum when the second call depends on the first call's output.
 `.trim();
+
 // ─── Context rule ──────────────────────────────────────────────────────────
 const CONTEXT_RULE = `
 CONTEXT RULE:
@@ -108,7 +114,10 @@ CONTEXT RULE:
 - If the guest answered a clarifying question (e.g. which hotel), immediately address their original request — do not greet them again.
 - Never ask for information the guest already provided earlier in the conversation.
 - Never give a generic "How can I help?" if there is an unanswered question already in the conversation.
+- If the guest provides check-in dates, guest count, AND personal details (name, phone, email) all in one message,
+  call getOffers first, then createBooking in the next turn — no confirmation step needed.
 `.trim();
+
 
 // ─── Hallucination guard — used when no RAG context is found ───────────────
 const NO_CONTEXT_INSTRUCTION = `
@@ -124,6 +133,8 @@ HARD RULES — no exceptions:
    Example: "I don't have that information available."
 5. This rule does NOT block actions — still use tools for bookings, lookups, payments, and check-in/out.
 `.trim();
+
+
 
 // ─── In-memory session store ───────────────────────────────────────────────
 const sessions = new Map();
