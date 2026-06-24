@@ -14,6 +14,7 @@ const app = express();
 app.use(cors({
   origin: [
     "http://localhost:3000",
+    "https://widget-frontend-three.vercel.app",        // ← update after Step 9
   ],
   methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization"],
@@ -36,7 +37,7 @@ const start = async () => {
 
   initModels();
 
-  const PORT = process.env.PORT;
+  const PORT = process.env.PORT || 8080;
 
   app.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);

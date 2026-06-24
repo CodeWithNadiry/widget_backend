@@ -12,13 +12,13 @@ if (!databaseUrl) {
 
 export const sequelize = new Sequelize(databaseUrl, {
   dialect: "postgres",
-  logging: false,
   dialectOptions: {
     ssl: {
       require: true,
       rejectUnauthorized: false, // required for Railway
     },
   },
+  logging: false,
 });
 
 export const connectDB = async () => {
