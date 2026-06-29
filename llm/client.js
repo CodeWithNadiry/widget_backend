@@ -10,6 +10,7 @@ export async function chatWithTools({ systemPrompt, history, tools = [] }) {
     messages,
     max_tokens: 1024,
     temperature: 0.3,
+    provider: "sambanova",
   };
 
   if (tools.length > 0) {
