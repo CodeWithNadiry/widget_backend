@@ -6,8 +6,7 @@ import { AppError, NotFoundError } from "../../utils/AppError.js";
 export const adminService = {
   // ─── Chatbot CRUD ────────────────────────────────────────────────────────
 
-  async createChatbot({ name, slug, systemPrompt, userId }) {
-    // check slug is not already taken
+  async createChatbot({ name, slug, systemPrompt, theme, userId }) {
     const existing = await Chatbot.findOne({ where: { slug } });
     if (existing) {
       throw new AppError("A chatbot with this slug already exists.", 409);
@@ -17,6 +16,7 @@ export const adminService = {
       name,
       slug,
       systemPrompt,
+      theme: theme ?? {},   // ✅ save theme
       createdBy: userId,
     });
 
@@ -35,35 +35,34 @@ export const adminService = {
   async getChatbotById({ chatbotId, userId }) {
     const chatbot = await Chatbot.findOne({
       where: { chatbotId, createdBy: userId },
+      attributes: ["chatbotId", "name", "slug", "systemPrompt", "theme"],
     });
-
-    if (!chatbot) {
-      throw new NotFoundError("Chatbot not found.");
-    }
-
+    if (!chatbot) throw new NotFoundError("Chatbot not found.");
     return chatbot;
   },
 
-
   async updateChatbot(chatbotId, data) {
-  const chatbot = await Chatbot.findByPk(chatbotId);
+    const chatbot = await Chatbot.findByPk(chatbotId);
+    if (!chatbot) throw new NotFoundError("Chatbot not found.");
 
-  if (!chatbot) {
-    throw new NotFoundError("Chatbot not found.");
-  }
+    // Only pass fields that were actually sent
+    const updates = {};
+    if (data.name !== undefined)         updates.name = data.name;
+    if (data.systemPrompt !== undefined) updates.systemPrompt = data.systemPrompt;
+    if (data.theme !== undefined)        updates.theme = data.theme;  // ✅ save theme
 
-  await chatbot.update(data);
+    await chatbot.update(updates);
 
-  return {
-    chatbot: {
-      chatbotId: chatbot.chatbotId,
-      name: chatbot.name,
-      slug: chatbot.slug,
-      systemPrompt: chatbot.systemPrompt,
-    },
-  };
-},
-
+    return {
+      chatbot: {
+        chatbotId: chatbot.chatbotId,
+        name: chatbot.name,
+        slug: chatbot.slug,
+        systemPrompt: chatbot.systemPrompt,
+        theme: chatbot.theme,  // ✅ return theme
+      },
+    };
+  },
 
   async deleteChatbot({ chatbotId, userId }) {
     const chatbot = await Chatbot.findOne({
@@ -80,7 +79,6 @@ export const adminService = {
   // ─── Property assignment ─────────────────────────────────────────────────
 
   async assignProperty({ chatbotId, propertyId, userId }) {
-    // verify chatbot belongs to this user
     const chatbot = await Chatbot.findOne({
       where: { chatbotId, createdBy: userId },
     });
@@ -89,7 +87,6 @@ export const adminService = {
       throw new NotFoundError("Chatbot not found.");
     }
 
-    // verify property belongs to this user
     const property = await Property.findOne({
       where: { propertyId, createdBy: userId },
     });
@@ -98,11 +95,9 @@ export const adminService = {
       throw new NotFoundError("Property not found.");
     }
 
-    // check if already assigned
     const alreadyAssigned = await ChatbotProperties.findOne({
       where: { chatbotId, propertyId },
     });
-
 
     if (alreadyAssigned) {
       throw new AppError("This property is already assigned to the chatbot.", 409);
@@ -112,7 +107,6 @@ export const adminService = {
   },
 
   async removeProperty({ chatbotId, propertyId, userId }) {
-    // verify chatbot belongs to this user
     const chatbot = await Chatbot.findOne({
       where: { chatbotId, createdBy: userId },
     });
@@ -132,23 +126,23 @@ export const adminService = {
     await assignment.destroy();
   },
 
-async getChatbotProperties({ chatbotId, userId }) {
-  const chatbot = await Chatbot.findOne({
-    where: { chatbotId, createdBy: userId },
-    include: [
-      {
-        model: Property,
-        through: { attributes: [] },
-      },
-    ],
-  }); // i want the chatbot and also related Property records
+  async getChatbotProperties({ chatbotId, userId }) {
+    const chatbot = await Chatbot.findOne({
+      where: { chatbotId, createdBy: userId },
+      include: [
+        {
+          model: Property,
+          through: { attributes: [] },
+        },
+      ],
+    });
 
-  if (!chatbot) {
-    throw new NotFoundError("Chatbot not found.");
-  }
+    if (!chatbot) {
+      throw new NotFoundError("Chatbot not found.");
+    }
 
-  return {
-    properties: chatbot.properties ?? [],  // ← lowercase 'properties'
-  };
-},
+    return {
+      properties: chatbot.properties ?? [],
+    };
+  },
 };

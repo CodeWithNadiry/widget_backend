@@ -4,9 +4,10 @@ import { chatbotService } from "./chatbot.service.js";
 export async function getChatbotBySlug(req, res, next) {
   try {
     const { slug } = req.params;
+    console.log('slug', slug)
     const chatbot = await Chatbot.findOne({
       where: { slug },
-      attributes: ["chatbotId", "name", "slug"],
+      attributes: ["chatbotId", "name", "slug", "theme"],
     });
     if (!chatbot)
       return res.status(404).json({ message: "Chatbot not found." });

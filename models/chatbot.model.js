@@ -11,9 +11,9 @@ const Chatbot = sequelize.define('chatbot', {
   slug: {
     type: DataTypes.STRING,
     allowNull: false,
-    unique: true,           // "crito", "partner-hotels" — must be unique
+    unique: true,
     validate: {
-      is: /^[a-z0-9-]+$/i  // only lowercase letters, numbers, hyphens
+      is: /^[a-z0-9-]+$/i
     }
   },
 
@@ -25,6 +25,21 @@ const Chatbot = sequelize.define('chatbot', {
   systemPrompt: {
     type: DataTypes.TEXT,
     allowNull: false,
+  },
+
+  // ── Theme ──────────────────────────────────────────────────────────────
+  // Change these per chatbot from your admin dashboard or directly in DB.
+  // primaryColor : float button, user message bubble, send button
+  // headerBg     : top bar background + AI avatar
+  // aiBubbleBg   : AI message bubble background
+  theme: {
+    type: DataTypes.JSON,
+    allowNull: false,
+    defaultValue: {
+      primaryColor: "#2563eb",
+      headerBg:     "#0f172a",
+      aiBubbleBg:   "#ffffff",
+    },
   },
 
   createdBy: {

@@ -2,14 +2,11 @@ import { adminService } from "./admin.service.js";
 
 export async function createChatbot(req, res, next) {
   try {
-    const { name, slug, systemPrompt } = req.body;
+    const { name, slug, systemPrompt, theme } = req.body; // ✅ already there
     const userId = req.userId;
 
     const chatbot = await adminService.createChatbot({
-      name,
-      slug,
-      systemPrompt,
-      userId,
+      name, slug, systemPrompt, theme, userId, // ✅ pass theme
     });
 
     res.status(201).json({ chatbot });
@@ -17,7 +14,6 @@ export async function createChatbot(req, res, next) {
     next(err);
   }
 }
-
 export async function getAllChatbots(req, res, next) {
   try {
     const userId = req.userId;
@@ -47,6 +43,7 @@ export async function getChatbotById(req, res, next) {
 export async function updateChatbot(req, res, next) {
   try {
     const { chatbotId } = req.params;
+    console.log("updateChatbot hit", chatbotId, req.body);
     const result = await adminService.updateChatbot(chatbotId, req.body);
     res.status(200).json(result);
   } catch (err) {
