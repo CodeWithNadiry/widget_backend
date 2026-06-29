@@ -1,4 +1,4 @@
-const HF_URL = "https://router.huggingface.co/v1/chat/completions";
+const HF_URL = "https://router.huggingface.co/sambanova/v1/chat/completions";
 const MODEL = "Qwen/Qwen2.5-72B-Instruct";
 // const MODEL  = "Qwen/Qwen2.5-7B-Instruct";
 
