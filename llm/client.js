@@ -1,5 +1,5 @@
 const HF_URL = "https://router.huggingface.co/v1/chat/completions";
-const MODEL = "Qwen/Qwen2.5-72B-Instruct";
+const MODEL = "Qwen/Qwen2.5-72B-Instruct:novita";
 // const MODEL  = "Qwen/Qwen2.5-7B-Instruct";
 
 export async function chatWithTools({ systemPrompt, history, tools = [] }) {
