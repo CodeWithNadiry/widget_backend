@@ -4,7 +4,6 @@ import { chatbotService } from "./chatbot.service.js";
 export async function getChatbotBySlug(req, res, next) {
   try {
     const { slug } = req.params;
-    console.log('slug', slug)
     const chatbot = await Chatbot.findOne({
       where: { slug },
       attributes: ["chatbotId", "name", "slug", "theme"],
