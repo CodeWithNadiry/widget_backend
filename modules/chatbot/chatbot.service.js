@@ -234,14 +234,14 @@ name, DOB, or offer number).
 // produced directly by translateToLanguage using the language already detected by
 // analyzeGuestMessage.
 const NO_CONTEXT_SENTENCES = {
-  doc: "I don't have information regarding that. Let me know if you need something else.",
-  property: "I don't have information regarding that. Let me know if you need something else.",
+  doc: "I don't have information regarding that — let me know if you need something else.",
+  property: "I don't have information regarding that — let me know if you need something else.",
 };
 
 // ─── Fixed booking-confirmation sentence ────────────────────────────────────
 // Kept as a single shared constant so both the translation call and any future reuse stay in
 // sync — see the createBooking short-circuit in runConversation for how this is used.
-  const BOOKING_CONFIRMED_SENTENCE = "Booking confirmed. Please check your email for the confirmation.";
+const BOOKING_CONFIRMED_SENTENCE = "Booking confirmed — please check your email for the confirmation.";
 
 // ─── Hotel scope rule — governs when RAG is chatbot-wide vs property-scoped ─
 // and, separately, when (if ever) the bot is allowed to ask which hotel.
@@ -341,6 +341,32 @@ function getOrCreateSession(sessionId, chatbotId) {
 function updateSession(sessionId, updates) {
   const session = sessions.get(sessionId);
   sessions.set(sessionId, { ...session, ...updates });
+}
+
+// ─── RAG relevance selection — tiered, not a single blind cutoff ───────────
+// A single hard cosine-distance cutoff is fragile: short or paraphrased guest
+// queries ("tell me about X", "when was X launched") often score a slightly
+// higher distance than a strict threshold even against the chunk that actually
+// answers them, so genuinely-covered topics were getting silently discarded
+// before the model ever saw them, producing a false "I don't have information"
+// refusal.
+//
+// Fix: keep the strict threshold as a fast, confident-match path, but add a
+// bounded fallback — if nothing clears the strict bar, take the closest few
+// chunks anyway, capped by a looser ceiling so wildly unrelated content still
+// never reaches the model. The model's own STRICT GROUNDING RULE in the system
+// prompt (already present) is what makes the final relevance call on fallback
+// chunks — it's a much better judge of "does this text actually answer the
+// question" than a single numeric distance ever can be, and it still refuses
+// cleanly, in character, if the fallback chunks don't truly cover the topic.
+function selectRelevantChunks(chunks, { strictThreshold, fallbackCeiling, fallbackTopN = 3 }) {
+  const strict = chunks.filter((c) => c.distance <= strictThreshold);
+  if (strict.length > 0) return { chunks: strict, usedFallback: false };
+
+  const sorted = [...chunks].sort((a, b) => a.distance - b.distance).slice(0, fallbackTopN);
+  const withinCeiling = sorted.filter((c) => c.distance <= fallbackCeiling);
+  if (withinCeiling.length === 0) return { chunks: [], usedFallback: false };
+  return { chunks: withinCeiling, usedFallback: true };
 }
 
 // Deterministic, non-LLM check for whether the guest named one of the
@@ -689,7 +715,7 @@ async function runConversation({ sessionId, systemPrompt, history, tools, sessio
         // Guest didn't already have full details ready — show offer cards as normal.
         updateSession(sessionId, { history: historyWithOffers });
         return reply("offers", {
-          text: "Here are the available offers. Reply with a number to choose your room.",
+          text: "Here are the available offers. Reply with a number to choose one.",
           data: result.offers,
         });
       }
@@ -768,16 +794,18 @@ async function handleDocumentOnlySession({ sessionId, chatbotId, message, chatbo
   const { intent, language, englishQuery } = await analyzeGuestMessage(message, session.history);
   const isSmallTalk = intent === "SMALL_TALK";
 
-  const ragChunks = await searchSimilarChunks({ query: englishQuery, chatbotId, topK: 5 });
-  // Tightened from 0.8 — that threshold (cosine distance, so 0.8 only requires
-  // ~20% similarity) was letting vague/generic queries ("how are you", "capital
-  // of pakistan") accidentally match unrelated chunks, which then got fed to the
-  // model as "the only source of truth," causing it to answer questions the docs
-  // never actually covered. If genuinely relevant content starts getting excluded
-  // for your specific documents/embedding model, raise this slightly — but start
-  // strict and loosen only if you see real misses, not the other way around.
+  const ragChunks = await searchSimilarChunks({ query: englishQuery, chatbotId, topK: 8 });
+  // Strict threshold: confident-match fast path. Fallback ceiling: bounded
+  // best-effort tier used only when nothing clears the strict bar — see
+  // selectRelevantChunks for why a single blind cutoff was causing real
+  // misses on genuinely-covered topics. Loosen these further only if you
+  // still see real misses after this change — don't loosen preemptively.
   const RELEVANCE_THRESHOLD = 0.35;
-  const relevantChunks = ragChunks.filter((c) => c.distance <= RELEVANCE_THRESHOLD);
+  const FALLBACK_RELEVANCE_CEILING = 0.55;
+  const { chunks: relevantChunks, usedFallback } = selectRelevantChunks(ragChunks, {
+    strictThreshold: RELEVANCE_THRESHOLD,
+    fallbackCeiling: FALLBACK_RELEVANCE_CEILING,
+  });
   const hasContext = relevantChunks.length > 0;
 
   const history = [...session.history, { role: "user", content: message }];
@@ -823,6 +851,14 @@ STRICT GROUNDING RULE — apply this check BEFORE answering, every time:
    or vague topical overlap does NOT count — the specific thing asked about must be genuinely present.
 3. Answer using only that information, and only the part that answers the question (see
    CONCISENESS above).
+${
+  usedFallback
+    ? `4. This INFORMATION was retrieved as a best-effort match, not a confident one — be extra
+   strict: if it does not genuinely and explicitly cover the guest's exact question, say
+   "I don't have information regarding that — let me know if you need something else." instead
+   of answering. Never stretch a loosely-related passage into an answer.`
+    : ""
+}
 `.trim()
     : ""
 }
@@ -906,6 +942,7 @@ async function handleWithProperties({ sessionId, chatbotId, message, properties,
   const effectiveSelectedOffer = offerSelection?.offer || currentSession.selectedOffer || null;
 
   let englishQuery, ragChunks, usedGeneralFallback, relevantChunks, hasContext, contextLabel, intent, language;
+  let usedContextFallback = false;
 
   if (offerSelection) {
     // Skip RAG and intent analysis entirely — this turn is a selection, not a
@@ -943,21 +980,34 @@ async function handleWithProperties({ sessionId, chatbotId, message, properties,
     // a chatbot-wide search — a confirmed hotel shouldn't block questions that are
     // answered by general/chatbot-wide documents.
     ragChunks = effectiveProperty
-      ? await searchSimilarChunks({ query: englishQuery, chatbotId, propertyId: effectiveProperty.propertyId, topK: 5 })
-      : await searchSimilarChunks({ query: englishQuery, chatbotId, topK: 5 });
+      ? await searchSimilarChunks({ query: englishQuery, chatbotId, propertyId: effectiveProperty.propertyId, topK: 8 })
+      : await searchSimilarChunks({ query: englishQuery, chatbotId, topK: 8 });
 
     usedGeneralFallback = false;
-    // Tightened from 0.78/0.8 — see the comment on RELEVANCE_THRESHOLD in
-    // handleDocumentOnlySession for why the looser values caused false-positive
-    // matches on vague/generic guest messages.
-    relevantChunks = ragChunks.filter((c) => c.distance <= (effectiveProperty ? 0.32 : 0.35));
+    // Strict thresholds: confident-match fast path (property-scoped is a touch
+    // tighter than chatbot-wide since it's a narrower document set). Fallback
+    // ceiling: bounded best-effort tier used only when nothing clears the
+    // strict bar — see selectRelevantChunks for why a single blind cutoff was
+    // discarding genuinely-covered topics before the model ever saw them.
+    const STRICT_THRESHOLD = effectiveProperty ? 0.32 : 0.35;
+    const FALLBACK_CEILING = effectiveProperty ? 0.5 : 0.55;
+    let selection = selectRelevantChunks(ragChunks, {
+      strictThreshold: STRICT_THRESHOLD,
+      fallbackCeiling: FALLBACK_CEILING,
+    });
+    relevantChunks = selection.chunks;
+    let usedFallback = selection.usedFallback;
 
     if (effectiveProperty && relevantChunks.length === 0) {
-      const generalChunks = await searchSimilarChunks({ query: englishQuery, chatbotId, topK: 5 });
-      const relevantGeneral = generalChunks.filter((c) => c.distance <= 0.35);
-      if (relevantGeneral.length > 0) {
+      const generalChunks = await searchSimilarChunks({ query: englishQuery, chatbotId, topK: 8 });
+      const generalSelection = selectRelevantChunks(generalChunks, {
+        strictThreshold: 0.35,
+        fallbackCeiling: 0.55,
+      });
+      if (generalSelection.chunks.length > 0) {
         ragChunks = generalChunks;
-        relevantChunks = relevantGeneral;
+        relevantChunks = generalSelection.chunks;
+        usedFallback = generalSelection.usedFallback;
         usedGeneralFallback = true;
       }
     }
@@ -966,6 +1016,8 @@ async function handleWithProperties({ sessionId, chatbotId, message, properties,
     // Label the context block correctly depending on whether we ended up using the
     // property-scoped result or fell back to the chatbot-wide general documents.
     contextLabel = effectiveProperty && !usedGeneralFallback ? "HOTEL INFORMATION" : "GENERAL INFORMATION";
+    // Exposed to the outer scope for the STRICT GROUNDING RULE caution note below.
+    usedContextFallback = usedFallback;
   }
 
   const isSmallTalk = intent === "SMALL_TALK";
@@ -1003,6 +1055,14 @@ STRICT GROUNDING RULE — apply this check BEFORE answering, every time:
 2. Does the ${contextLabel} above contain that EXACT subject, explicitly? A shared
    keyword or vague topical overlap does NOT count — the specific thing asked about must genuinely be present.
 3. Answer using ONLY that information, and ONLY the part that answers the question.
+${
+  usedContextFallback
+    ? `4. This ${contextLabel} was retrieved as a best-effort match, not a confident one — be extra
+   strict: if it does not genuinely and explicitly cover the guest's exact question, say you
+   don't have that information instead of answering. Never stretch a loosely-related passage
+   into an answer.`
+    : ""
+}
 
 RAG CONCISENESS — MOST IMPORTANT RULE for factual answers, applies above all else:
 - Answer ONLY the exact thing the guest asked. Never add extra facts from the source above
@@ -1266,7 +1326,7 @@ export const chatbotService = {
     updateSession(sessionId, { lastOffers: numberedOffers, selectedOffer: null });
 
     return reply("offers", {
-      text: "Here are the available offers. Reply with a number to choose your room.",
+      text: "Here are the available offers. Reply with a number to choose one.",
       data: numberedOffers,
     });
   },
