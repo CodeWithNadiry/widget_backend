@@ -234,8 +234,8 @@ name, DOB, or offer number).
 // produced directly by translateToLanguage using the language already detected by
 // analyzeGuestMessage.
 const NO_CONTEXT_SENTENCES = {
-  doc: "I don't have information regarding that — let me know if you need something else.",
-  property: "I don't have information regarding that — let me know if you need something else.",
+  doc: "I don't have information regarding that. Let me know if you need something else.",
+  property: "I don't have information regarding that. Let me know if you need something else.",
 };
 
 // ─── Fixed booking-confirmation sentence ────────────────────────────────────
@@ -715,7 +715,7 @@ async function runConversation({ sessionId, systemPrompt, history, tools, sessio
         // Guest didn't already have full details ready — show offer cards as normal.
         updateSession(sessionId, { history: historyWithOffers });
         return reply("offers", {
-          text: "Here are the available offers. Reply with a number to choose one.",
+          text: "Here are the available offers. Reply with a number to choose your room.",
           data: result.offers,
         });
       }
@@ -1326,7 +1326,7 @@ export const chatbotService = {
     updateSession(sessionId, { lastOffers: numberedOffers, selectedOffer: null });
 
     return reply("offers", {
-      text: "Here are the available offers. Reply with a number to choose one.",
+      text: "Here are the available offers. Reply with a number to choose your room.",
       data: numberedOffers,
     });
   },
