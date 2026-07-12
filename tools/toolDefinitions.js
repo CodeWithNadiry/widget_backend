@@ -147,7 +147,7 @@ const checkIn = {
   function: {
     name: "checkIn",
     description:
-      "Perform check-in for a reservation. Rules: no negative folio balance; earliest check-in is 14:00 on arrival day. Confirm reservationId with the guest before calling.",
+      "Perform check-in for a reservation. Rules: no negative folio balance; earliest check-in is 14:00 on arrival day. Resolve the reservationId via getReservation first if it isn't already known — never ask the guest for a raw reservation ID by name, use phone last 4 or name+DOB+room instead.",
     parameters: {
       type: "object",
       required: ["reservationId"],
@@ -307,6 +307,9 @@ export const toolDefinitions = {
   selectProperty,
 
   // all tools available once property is locked (active state)
+  // NOTE: requestBookingFlow was removed — the booking modal now opens ONLY
+  // via the "Book a Stay" button click (__book_stay__), never from typed text.
+  // Typed booking intent is handled entirely in chat (see BOOKING INTENT in TOOL_RULE).
   all: [
     getReservation,
     getOffers,

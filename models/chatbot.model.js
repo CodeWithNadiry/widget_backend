@@ -1,7 +1,7 @@
 import { DataTypes } from "sequelize";
 import { sequelize } from "../db/client.js";
 
-const Chatbot = sequelize.define('chatbot', {
+const Chatbot = sequelize.define("chatbot", {
   chatbotId: {
     type: DataTypes.UUID,
     defaultValue: DataTypes.UUIDV4,
@@ -13,8 +13,8 @@ const Chatbot = sequelize.define('chatbot', {
     allowNull: false,
     unique: true,
     validate: {
-      is: /^[a-z0-9-]+$/i
-    }
+      is: /^[a-z0-9-]+$/i,
+    },
   },
 
   name: {
@@ -33,20 +33,27 @@ const Chatbot = sequelize.define('chatbot', {
   // headerBg     : top bar background + AI avatar
   // aiBubbleBg   : AI message bubble background
   theme: {
-    type: DataTypes.JSON,
-    allowNull: false,
-    defaultValue: {
-      primaryColor: "#2563eb",
-      headerBg:     "#0f172a",
-      aiBubbleBg:   "#ffffff",
-    },
+  type: DataTypes.JSON,
+  allowNull: false,
+  defaultValue: {
+    primaryColor: "#2563eb",
+    headerBg:     "#0f172a",
+    aiBubbleBg:   "#ffffff",
+    chatbg:       "#f8fafc",
+    headerTextColor: '#ffffff'
+  },
+},
+  logoUrl: {
+    type: DataTypes.STRING,
+    allowNull: true,
+    validate: { isUrl: { msg: "logoUrl must be a valid URL" } },
   },
 
   createdBy: {
     type: DataTypes.UUID,
     allowNull: false,
-    references: { model: 'users', key: 'userId' },
-    onDelete: 'CASCADE',
+    references: { model: "users", key: "userId" },
+    onDelete: "CASCADE",
   },
 });
 

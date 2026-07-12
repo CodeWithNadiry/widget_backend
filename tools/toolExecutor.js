@@ -77,10 +77,11 @@ async function getOffers({ propertyId, toolInput, headers }) {
   if (result?.offers) {
     return {
       offers: result.offers.map((offer) => ({
-        ratePlanId: offer.rate_plan_id,  // renamed to match createBooking param
+        ratePlanId: offer.rate_plan_id, // renamed to match createBooking param
         name: offer.name,
         amount: offer.total_amount?.amount,
         currency: offer.total_amount?.currency,
+        roomName: offer.unit_group.name,
         IMPORTANT: `You MUST pass ratePlanId="${offer.rate_plan_id}" to createBooking. This is the only valid value.`,
       })),
     };
@@ -88,6 +89,7 @@ async function getOffers({ propertyId, toolInput, headers }) {
 
   return result;
 }
+
 async function createBooking({ propertyId, toolInput, headers }) {
   const {
     arrival,
@@ -215,6 +217,7 @@ async function apiCall(url, options) {
       };
     }
 
+    
     return data;
   } catch (err) {
     return {

@@ -33,15 +33,17 @@ export const validateRequest = (schemas) => {
       }
 
       if (query) {
-        const result = query.safeParse(req.query);
-        if (!result.success) {
-          const message = Object.values(result.error.flatten().fieldErrors)
-            .flat()
-            .join(", ");
-          throw new AppError(message || "Validation failed", 422);
-        }
-        req.query = result.data;
-      }
+  const result = query.safeParse(req.query);
+
+  if (!result.success) {
+    const message = Object.values(result.error.flatten().fieldErrors)
+      .flat()
+      .join(", ");
+    throw new AppError(message || "Validation failed", 422);
+  }
+
+  Object.assign(req.query, result.data);
+}
 
       next();
     } catch (err) {
