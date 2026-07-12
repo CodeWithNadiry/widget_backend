@@ -241,7 +241,7 @@ const NO_CONTEXT_SENTENCES = {
 // ─── Fixed booking-confirmation sentence ────────────────────────────────────
 // Kept as a single shared constant so both the translation call and any future reuse stay in
 // sync — see the createBooking short-circuit in runConversation for how this is used.
-const BOOKING_CONFIRMED_SENTENCE = "Booking confirmed — please check your email for the confirmation.";
+  const BOOKING_CONFIRMED_SENTENCE = "Booking confirmed. Please check your email for the confirmation.";
 
 // ─── Hotel scope rule — governs when RAG is chatbot-wide vs property-scoped ─
 // and, separately, when (if ever) the bot is allowed to ask which hotel.
