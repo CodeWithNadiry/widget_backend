@@ -39,6 +39,7 @@ export async function chatWithTools({ systemPrompt, history, tools = [], model =
     body: JSON.stringify(body),
   });
 
+  console.log(response)
   if (!response.ok) {
     const error = await response.text();
     throw new Error(`HuggingFace API error ${response.status}: ${error}`);

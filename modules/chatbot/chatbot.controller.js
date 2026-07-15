@@ -1,7 +1,7 @@
 import Chatbot from "../../models/chatbot.model.js";
 import { chatbotService } from "./chatbot.service.js";
-
 import cloudinary from '../../lib/cloudinary.js'
+console.log('controller running...')
 export async function getChatbotBySlug(req, res, next) {
   try {
     const { slug } = req.params;
@@ -46,9 +46,12 @@ export async function uploadChatbotLogo(req, res, next) {
     next(err);
   }
 }
+
 export async function handleMessage(req, res, next) {
   try {
+    console.log(req)
     const { sessionId, chatbotId, message } = req.body;
+    console.log("🚀 ~ handleMessage ~ req.body:", req.body)
 
     const reply = await chatbotService.handleMessage({
       sessionId,
@@ -56,6 +59,7 @@ export async function handleMessage(req, res, next) {
       message,
     });
 
+    console.log('reply', reply)
     res.status(200).json({ reply });
   } catch (err) {
     next(err);

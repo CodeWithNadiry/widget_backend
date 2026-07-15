@@ -1,6 +1,24 @@
 // ─── Tool Definitions ──────────────────────────────────────────────────────
 // Each tool follows the OpenAI-compatible format Qwen expects.
 // property_id is NEVER included — always injected server-side from session.
+//
+// NOTE: getRoomPasscode, submitFeedback, and sendWhatsappRecovery have been
+// removed entirely — these tools no longer exist anywhere in the system.
+//
+// NOTE: createBooking is defined here for documentation/executor reuse only.
+// It is intentionally NOT included in `all` — the LLM never sees or calls
+// this tool. Booking is completed by deterministic code (see
+// handleGuestDetailCollection in chatbot.service.js) only after the guest has
+// gone through sequential detail collection and explicitly confirmed. This
+// removes booking-with-real-money decisions from LLM judgment entirely.
+//
+// CHANGE LOG (review fixes — see chatbot.service.js for the actual logic):
+// - No schema changes were required for Problems 1-6. Reservation-reference
+//   resolution ("last one", "the confirmed one", etc.) is handled entirely in
+//   the service layer against the array getReservation already returns when
+//   multiple matches come back — it does not need a new tool or a new field
+//   here. Keeping this file's surface area untouched is intentional: your
+//   executor and getReservation's multi-match contract are unchanged.
 
 const selectProperty = {
   type: "function",
@@ -26,7 +44,7 @@ const getReservation = {
   function: {
     name: "getReservation",
     description:
-      "Fetch a reservation's full details (status, passcode hint, payment link, tasks). Use this first whenever the guest asks about their booking, wants to resend a confirmation form, payment link, or access details. THREE MUTUALLY EXCLUSIVE modes — use exactly ONE per call: (A) reservationId ONLY — Apaleo confirmation id e.g. ABC-1. (B) phoneLast4 ONLY — exactly 4 digits. (C) lastName + dateOfBirth (YYYY-MM-DD) + roomNumber — all three together. Never mix fields across modes.",
+      "Fetch a reservation's full details (status, payment link, tasks). Use this first whenever the guest asks about their booking or wants to resend a confirmation form or payment link. THREE MUTUALLY EXCLUSIVE modes — use exactly ONE per call: (A) reservationId ONLY — Apaleo confirmation id e.g. ABC-1. (B) phoneLast4 ONLY — exactly 4 digits. (C) lastName + dateOfBirth (YYYY-MM-DD) + roomNumber — all three together. Never mix fields across modes. NOTE: if this returns multiple reservations, do NOT ask the guest to repeat identifying details — the app resolves natural references like 'last one', 'the confirmed one', or 'tomorrow's booking' automatically before your next turn.",
     parameters: {
       type: "object",
       properties: {
@@ -65,7 +83,7 @@ const getOffers = {
   function: {
     name: "getOffers",
     description:
-      "List available rate plans for given arrival, departure, and adults. Always call this before createBooking. Infer adults from room intent (single=1, double=2, triple=3). Dates must be YYYY-MM-DD; departure must be after arrival.",
+      "List available rate plans for given arrival, departure, and adults. Infer adults from room intent (single=1, double=2, triple=3). Dates must be YYYY-MM-DD; departure must be after arrival. Once this returns, the app shows the offers to the guest and handles the rest of the booking flow automatically — you do not need (and cannot) call createBooking yourself.",
     parameters: {
       type: "object",
       required: ["arrival", "departure", "adults"],
@@ -87,12 +105,15 @@ const getOffers = {
   },
 };
 
+// Not passed to the LLM (see note above) — kept here purely as a documented
+// schema, since the executor's createBooking implementation still expects
+// these exact field names when called directly from code.
 const createBooking = {
   type: "function",
   function: {
     name: "createBooking",
     description:
-      "Create a reservation after the guest picks a ratePlanId from getOffers. Collect firstName, lastName, phone in E.164 format; email is optional. Always confirm spelling for email if given.",
+      "[CODE-INVOKED ONLY — never exposed to the model] Create a reservation after the guest has confirmed their details.",
     parameters: {
       type: "object",
       required: [
@@ -105,38 +126,14 @@ const createBooking = {
         "guestPhone",
       ],
       properties: {
-        arrival: {
-          type: "string",
-          description: "YYYY-MM-DD",
-        },
-        departure: {
-          type: "string",
-          description: "YYYY-MM-DD",
-        },
-        adults: {
-          type: "integer",
-          description: "Number of adults 1–10",
-        },
-        ratePlanId: {
-          type: "string",
-          description: "From getOffers e.g. RPL-SINGLE-STD",
-        },
-        guestFirstName: {
-          type: "string",
-          description: "Guest first name",
-        },
-        guestLastName: {
-          type: "string",
-          description: "Guest last name",
-        },
-        guestPhone: {
-          type: "string",
-          description: "E.164 format e.g. +491234567890",
-        },
-        guestEmail: {
-          type: "string",
-          description: "Optional. Valid email address.",
-        },
+        arrival: { type: "string", description: "YYYY-MM-DD" },
+        departure: { type: "string", description: "YYYY-MM-DD" },
+        adults: { type: "integer", description: "Number of adults 1–10" },
+        ratePlanId: { type: "string", description: "From getOffers e.g. RPL-SINGLE-STD" },
+        guestFirstName: { type: "string", description: "Guest first name" },
+        guestLastName: { type: "string", description: "Guest last name" },
+        guestPhone: { type: "string", description: "E.164 format e.g. +491234567890" },
+        guestEmail: { type: "string", description: "Valid email address." },
       },
     },
   },
@@ -180,35 +177,6 @@ const checkOut = {
   },
 };
 
-const getRoomPasscode = {
-  type: "function",
-  function: {
-    name: "getRoomPasscode",
-    description:
-      "Return the room keypad passcode after identity verification. Use when the guest is checked in and needs the door code. TWO modes: (A) fullName + dateOfBirth. (B) reservationId + dateOfBirth. If both fullName and reservationId are provided, reservationId takes priority.",
-    parameters: {
-      type: "object",
-      required: ["dateOfBirth"],
-      properties: {
-        dateOfBirth: {
-          type: "string",
-          description: "YYYY-MM-DD. Required in both modes.",
-        },
-        fullName: {
-          type: "string",
-          description:
-            "Mode A: full name as registered. Ignored if reservationId is also set.",
-        },
-        reservationId: {
-          type: "string",
-          description:
-            "Mode B: Apaleo reservation id. Takes priority over fullName.",
-        },
-      },
-    },
-  },
-};
-
 const cancelReservation = {
   type: "function",
   function: {
@@ -228,97 +196,16 @@ const cancelReservation = {
   },
 };
 
-const submitFeedback = {
-  type: "function",
-  function: {
-    name: "submitFeedback",
-    description:
-      "Submit guest feedback for a reservation. Required: reservationId and overall rating 1–5. Optional: comment and sub-ratings for cleanliness, staff, location, value (each 1–5). Only call after the guest gives at least the overall rating.",
-    parameters: {
-      type: "object",
-      required: ["reservationId", "rating"],
-      properties: {
-        reservationId: {
-          type: "string",
-          description: "Apaleo reservation id",
-        },
-        rating: {
-          type: "integer",
-          description: "Overall rating 1–5",
-        },
-        comment: {
-          type: "string",
-          description: "Optional free-text comment",
-        },
-        cleanlinessRating: {
-          type: "integer",
-          description: "Optional 1–5",
-        },
-        staffRating: {
-          type: "integer",
-          description: "Optional 1–5",
-        },
-        locationRating: {
-          type: "integer",
-          description: "Optional 1–5",
-        },
-        valueRating: {
-          type: "integer",
-          description: "Optional 1–5",
-        },
-      },
-    },
-  },
-};
-
-const sendWhatsappRecovery = {
-  type: "function",
-  function: {
-    name: "sendWhatsappRecovery",
-    description:
-      "Resend the guest's confirmation form link, payment link, or room passcode via WhatsApp. Only call after reservationId is already resolved via getReservation. messageType values: 'confirmation' = registration form URL, 'payment' = payment link, 'passcode' = door code via e-key flow.",
-    parameters: {
-      type: "object",
-      required: ["reservationId", "messageType"],
-      properties: {
-        reservationId: {
-          type: "string",
-          description:
-            "Apaleo reservation id already resolved by getReservation",
-        },
-        messageType: {
-          type: "string",
-          enum: ["confirmation", "checkin", "payment_reminder", "passcode"],
-          description: "confirmation = registration form, checkin = check-in link, payment_reminder = payment URL, passcode = door code",
-        },
-        idempotencyKey: {
-          type: "string",
-          description: "Optional. Short unique key to prevent duplicate sends.",
-        },
-      },
-    },
-  },
-};
-
 // ─── Exports ────────────────────────────────────────────────────────────────
 
 export const toolDefinitions = {
   // used during awaitingProperty state only
   selectProperty,
 
-  // all tools available once property is locked (active state)
-  // NOTE: requestBookingFlow was removed — the booking modal now opens ONLY
-  // via the "Book a Stay" button click (__book_stay__), never from typed text.
-  // Typed booking intent is handled entirely in chat (see BOOKING INTENT in TOOL_RULE).
-  all: [
-    getReservation,
-    getOffers,
-    createBooking,
-    checkIn,
-    checkOut,
-    getRoomPasscode,
-    cancelReservation,
-    submitFeedback,
-    sendWhatsappRecovery,
-  ],
+  // Kept for the executor / documentation only — NOT passed to the model.
+  createBooking,
+
+  // all tools the LLM is allowed to call once a property is locked (active state).
+  // createBooking is deliberately excluded — see note above.
+  all: [getReservation, getOffers, checkIn, checkOut, cancelReservation],
 };

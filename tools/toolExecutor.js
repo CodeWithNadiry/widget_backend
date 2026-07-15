@@ -2,14 +2,42 @@ import { AppError } from "../utils/AppError.js";
 
 const BASE_URL = "https://api.innolink.technology/api/pms/apaleo/properties";
 
+// FIX — no timeout on fetch was the cause of multi-minute hangs on checkIn/
+// checkOut/cancelReservation/getReservation. Node's fetch (undici) has NO
+// default timeout — if the upstream Apaleo API stalls, retries internally,
+// or the connection just sits open, the request waits indefinitely (or
+// until some platform-level limit finally kills it, which is exactly the
+// "2.1min to checkin" symptom). This adds a hard AbortController timeout so
+// a slow/hanging call fails FAST and predictably instead of blocking the
+// whole chat turn. Tune API_TIMEOUT_MS to whatever your real Apaleo p99
+// latency is — 15s is a reasonable starting point for guest-facing chat.
+const API_TIMEOUT_MS = 15000;
+
 /**
- * Executes a tool call from the LLM.
+ * Executes a tool call from the LLM (or, for createBooking, directly from
+ * deterministic code — see handleGuestDetailCollection in chatbot.service.js).
  * propertyId is ALWAYS injected from the session — never from LLM tool input.
+ *
+ * NOTE: getRoomPasscode, submitFeedback, and sendWhatsappRecovery have been
+ * removed entirely — these tools no longer exist anywhere in the system.
  */
 export async function executeTool({ toolName, toolInput, session, property }) {
   const propertyId = property.apaleoCode;
 
+  // DEBUG — log exactly what's being sent for every tool call. This is the
+  // first thing to check: if propertyId or apiKey is missing/wrong, every
+  // getReservation/cancelReservation call will fail before it even reaches
+  // the PMS correctly.
+  console.log(
+    `[toolExecutor] CALL toolName=${toolName} propertyId=${propertyId} apiKeyPresent=${Boolean(
+      property?.apiKey,
+    )} toolInput=${JSON.stringify(toolInput)}`,
+  );
+
   if (!propertyId) {
+    console.error(
+      `[toolExecutor] ABORT — no apaleoCode on property: ${JSON.stringify(property)}`,
+    );
     throw new AppError("Property not selected. Cannot execute tool.", 400);
   }
 
@@ -19,28 +47,36 @@ export async function executeTool({ toolName, toolInput, session, property }) {
     "Content-Type": "application/json",
   };
 
+  let result;
   switch (toolName) {
     case "getReservation":
-      return await getReservation({ propertyId, toolInput, headers });
+      result = await getReservation({ propertyId, toolInput, headers });
+      break;
     case "getOffers":
-      return await getOffers({ propertyId, toolInput, headers });
+      result = await getOffers({ propertyId, toolInput, headers });
+      break;
     case "createBooking":
-      return await createBooking({ propertyId, toolInput, headers });
+      result = await createBooking({ propertyId, toolInput, headers });
+      break;
     case "checkIn":
-      return await checkIn({ propertyId, toolInput, headers });
+      result = await checkIn({ propertyId, toolInput, headers });
+      break;
     case "checkOut":
-      return await checkOut({ propertyId, toolInput, headers });
-    case "getRoomPasscode":
-      return await getRoomPasscode({ propertyId, toolInput, headers });
+      result = await checkOut({ propertyId, toolInput, headers });
+      break;
     case "cancelReservation":
-      return await cancelReservation({ propertyId, toolInput, headers });
-    case "submitFeedback":
-      return await submitFeedback({ propertyId, toolInput, headers });
-    case "sendWhatsappRecovery":
-      return await sendWhatsappRecovery({ propertyId, toolInput, headers });
+      result = await cancelReservation({ propertyId, toolInput, headers });
+      break;
     default:
       throw new AppError(`Unknown tool: ${toolName}`, 400);
   }
+
+  // DEBUG — log the final result being handed back to the chatbot logic, so
+  // you can see in one place whether the PMS call actually succeeded or
+  // silently returned success:false.
+  console.log(`[toolExecutor] RESULT toolName=${toolName} =>`, JSON.stringify(result));
+
+  return result;
 }
 
 // ─── Tool implementations ──────────────────────────────────────────────────
@@ -137,19 +173,6 @@ async function checkOut({ propertyId, toolInput, headers }) {
   );
 }
 
-async function getRoomPasscode({ propertyId, toolInput, headers }) {
-  const { dateOfBirth, fullName, reservationId } = toolInput;
-  return await apiCall(`${BASE_URL}/${propertyId}/voice/room-passcode`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify({
-      date_of_birth: dateOfBirth,
-      full_name: fullName || "",
-      reservation_id: reservationId || "",
-    }),
-  });
-}
-
 async function cancelReservation({ propertyId, toolInput, headers }) {
   const { reservationId } = toolInput;
   return await apiCall(
@@ -158,57 +181,36 @@ async function cancelReservation({ propertyId, toolInput, headers }) {
   );
 }
 
-async function submitFeedback({ propertyId, toolInput, headers }) {
-  const {
-    reservationId,
-    rating,
-    comment = "",
-    cleanlinessRating,
-    staffRating,
-    locationRating,
-    valueRating,
-  } = toolInput;
-
-  return await apiCall(
-    `${BASE_URL}/${propertyId}/voice/reservations/${reservationId}/feedback`,
-    {
-      method: "POST",
-      headers,
-      body: JSON.stringify({
-        rating,
-        comment,
-        cleanliness_rating: cleanlinessRating,
-        staff_rating: staffRating,
-        location_rating: locationRating,
-        value_rating: valueRating,
-      }),
-    },
-  );
-}
-
-async function sendWhatsappRecovery({ propertyId, toolInput, headers }) {
-  const { reservationId, messageType, idempotencyKey } = toolInput;
-  const result = await apiCall(
-    `${BASE_URL}/${propertyId}/voice/reservations/${reservationId}/send-whatsapp`,
-    {
-      method: "POST",
-      headers,
-      body: JSON.stringify({
-        message_type: messageType,
-        idempotency_key: idempotencyKey || undefined,
-      }),
-    },
-  );
-  console.log("sendWhatsappRecovery result:", JSON.stringify(result)); // ← add this
-  return result;
-}
-
 // ─── Shared fetch helper ───────────────────────────────────────────────────
 
 async function apiCall(url, options) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), API_TIMEOUT_MS);
+  const startedAt = Date.now();
+
+  // DEBUG — log every outgoing request. Headers are logged with the API key
+  // masked so this is safe to leave in staging logs temporarily.
+  const safeHeaders = { ...options.headers, "X-API-Key": options.headers?.["X-API-Key"] ? "***" : undefined };
+  console.log(`[toolExecutor] REQUEST ${options.method} ${url} headers=${JSON.stringify(safeHeaders)} body=${options.body || ""}`);
+
   try {
-    const response = await fetch(url, options);
-    const data = await response.json();
+    const response = await fetch(url, { ...options, signal: controller.signal });
+    const rawText = await response.text();
+
+    // DEBUG — log raw status + body BEFORE any parsing/interpretation, so a
+    // 401/403/404/500 is immediately visible instead of being swallowed
+    // into a generic "not found" a few lines later.
+    console.log(
+      `[toolExecutor] RESPONSE status=${response.status} ok=${response.ok} url=${url} body=${rawText.slice(0, 1000)}`,
+    );
+
+    let data;
+    try {
+      data = rawText ? JSON.parse(rawText) : {};
+    } catch (parseErr) {
+      console.error(`[toolExecutor] JSON PARSE FAILED for ${url}:`, parseErr.message, "raw:", rawText.slice(0, 500));
+      return { success: false, error: "Invalid response from server." };
+    }
 
     if (!response.ok) {
       return {
@@ -217,12 +219,25 @@ async function apiCall(url, options) {
       };
     }
 
-    
     return data;
   } catch (err) {
+    // FIX — distinguish a timeout from every other failure mode so it's
+    // visible in logs instead of looking like a generic network error, and
+    // so the guest gets a clean "try again" message instead of a hang.
+    const elapsedMs = Date.now() - startedAt;
+    if (err.name === "AbortError") {
+      console.error(`[toolExecutor] TIMEOUT after ${elapsedMs}ms calling ${url}`);
+      return {
+        success: false,
+        error: "Request timed out.",
+      };
+    }
+    console.error(`[toolExecutor] API request failed after ${elapsedMs}ms calling ${url}:`, err.message);
     return {
       success: false,
       error: "API request failed: " + err.message,
     };
+  } finally {
+    clearTimeout(timeoutId);
   }
 }

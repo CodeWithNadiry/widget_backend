@@ -2,7 +2,6 @@ import { Router } from "express";
 import { validateRequest } from "../../middleware/validateRequest.js";
 import { verifyInternalKey } from "../../middleware/verifyInternalKey.js";
 import multer from "multer";
-
 import {
   chatMessageSchema,
   searchOffersSchema,
