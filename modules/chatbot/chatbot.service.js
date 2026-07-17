@@ -6,6 +6,27 @@ import { chatWithTools, UTILITY_MODEL } from "../../llm/client.js";
 import { toolDefinitions } from "../../tools/toolDefinitions.js";
 import { executeTool } from "../../tools/toolExecutor.js";
 
+// ─── Structured logging ─────────────────────────────────────────────────────
+// One line per event, truncated so nothing floods the console. Every log
+// starts with [chatbot] so it's grep-able, and includes a short session id
+// so a single conversation's events can be traced together.
+function shortId(id) {
+  return id ? String(id).slice(0, 8) : "none";
+}
+
+function truncate(value, max = 140) {
+  if (typeof value !== "string") return value;
+  return value.length > max ? `${value.slice(0, max)}…` : value;
+}
+
+function logEvent(sessionId, event, data = {}) {
+  const parts = Object.entries(data)
+    .filter(([, v]) => v !== undefined)
+    .map(([k, v]) => `${k}=${JSON.stringify(truncate(v))}`)
+    .join(" ");
+  console.log(`[chatbot] session=${shortId(sessionId)} event=${event}${parts ? " " + parts : ""}`);
+}
+
 // ─── Response envelope ──────────────────────────────────────────────────────
 function reply(type, { text, data } = {}) {
   return { type, text, data };
@@ -48,11 +69,6 @@ GOOD: "No rooms are available for those dates. Want to try different ones?"
 `.trim();
 
 // ─── Punctuation / professionalism rule ────────────────────────────────────
-// FIX — requested: replies were using em-dash-joined fragments that read as
-// casual run-ons, e.g. "...those details — could you double check and try
-// again?" Every sentence should be a complete sentence ending in its own
-// full stop, question mark, or exclamation point — no em-dash used as a
-// substitute for a period before a new independent clause.
 const PUNCTUATION_RULE = `
 PUNCTUATION RULE:
 - Write in complete, professional sentences. Every independent clause ends with its own full stop,
@@ -258,7 +274,13 @@ const INVALID_EMAIL_SENTENCE =
 const INVALID_PHONE_SENTENCE =
   "That doesn't look like a valid phone number. Please include your country code and try again.";
 const BOOKING_CANCELLED_SENTENCE =
-  "No problem. Let me know if you'd like to try a different room.";
+  "No problem. Please let me know if your reservation details are incorrect, if you'd like to choose a different room, or if you'd like to cancel this booking.";
+const BOOKING_CANCELLED_FINAL_SENTENCE =
+  "No problem, this booking request has been cancelled. Let me know if you'd like to start a new one.";
+const PAYMENT_LINK_REFUSAL_SENTENCE =
+  "Sorry, I can't send payment links through this chat.";
+const FEEDBACK_REFUSAL_SENTENCE =
+  "Sorry, I can't submit guest feedback through this chat.";
 const BOOKING_FAILED_SENTENCE =
   "That booking couldn't be completed right now. Want to try again or pick a different room?";
 const UNCLEAR_CONFIRMATION_SENTENCE =
@@ -306,6 +328,21 @@ const ACTION_FAILED_SENTENCE =
 const UNCLEAR_ACTION_CONFIRMATION_SENTENCE =
   "Please reply yes to go ahead, or no to cancel.";
 
+// Guest asked for something this assistant has no tool for at all (payment
+// links, emailing/WhatsApp-ing a receipt/invoice/confirmation/key/passcode,
+// etc.) — reply immediately, never collect hotel/verification details first.
+const UNSUPPORTED_ACTION_SENTENCE =
+  "Sorry, I can't send that through this chat. Please contact the hotel directly for that.";
+
+// Fallback used if the action-verification flow is ever entered for an
+// intent it doesn't actually know how to handle (defensive backstop).
+const ACTION_UNRECOGNIZED_SENTENCE =
+  "I'm not able to help with that request here. Please contact the hotel directly, or let me know if there's something else I can do.";
+
+// ─── Fixed sentence for an LLM/tool failure mid-conversation ──────────────
+const LLM_FAILURE_SENTENCE =
+  "I'm having trouble processing that right now. Could you try again in a moment?";
+
 const ACTION_SUCCESS_SENTENCES = {
   CANCEL: "Your reservation has been cancelled.",
   CHECK_IN: "You're checked in. Enjoy your stay!",
@@ -344,11 +381,6 @@ function buildReservationListText(reservations) {
   return `I found a few matching bookings. Which one?\n${lines.join("\n")}`;
 }
 
-// Used when the guest asks about their reservation WHILE mid-confirmation
-// (e.g. "give me the detail about my reservation status") instead of
-// answering yes/no. We already have the resolved reservation in memory, so
-// this is answered directly — no RAG, no model call. Also reused as the
-// terminal response for the LOOKUP intent (see handleActionFlow below).
 function buildReservationDetailText(reservation) {
   const lines = [
     `- **Reservation ID:** ${reservation.reservationId || "—"}`,
@@ -360,24 +392,15 @@ function buildReservationDetailText(reservation) {
   return lines.join("\n");
 }
 
-// Detects a message that's asking about the reservation itself rather than
-// answering yes/no — used to distinguish "what's happening with my booking"
-// from a genuinely unclear reply during the confirmation step.
 const RESERVATION_INFO_QUERY_REGEX =
   /\b(detail|details|status|info|information|dates?|when|room number|arrival|departure|check-?in|check-?out)\b/i;
 
-// PMS error messages (e.g. "Check-in not allowed before 14:00 on arrival
-// day") are exactly what the guest needs to hear — showing the generic
-// fallback instead throws away real, actionable information. This filters
-// out anything that looks like an internal code/exception rather than a
-// guest-readable sentence, so we never leak something like "ECONNRESET" or
-// a bare error code into the chat.
 function looksLikeGuestReadableMessage(text) {
   if (!text || typeof text !== "string") return false;
   const trimmed = text.trim();
   if (trimmed.length < 5 || trimmed.length > 200) return false;
-  if (!/\s/.test(trimmed)) return false; // single token, e.g. "ECONNRESET" or "NOT_FOUND"
-  if (/^[A-Z0-9_\-]+$/.test(trimmed)) return false; // ALL_CAPS_CODE style
+  if (!/\s/.test(trimmed)) return false;
+  if (/^[A-Z0-9_\-]+$/.test(trimmed)) return false;
   if (
     /exception|stack trace|undefined|null\b|\bENOTFOUND\b|\bECONNREFUSED\b/i.test(
       trimmed,
@@ -387,18 +410,6 @@ function looksLikeGuestReadableMessage(text) {
   return true;
 }
 
-// ═════════════════════════════════════════════════════════════════════════
-// Capability-boundary bypass guard for raw PMS error text
-// ═════════════════════════════════════════════════════════════════════════
-// A PMS error message can be a perfectly well-formed, guest-readable
-// sentence (looksLikeGuestReadableMessage above correctly says yes) and
-// STILL promise a delivery channel this chatbot has no tool to use — e.g.
-// "Registration form must be submitted before check-in. Ask us to resend
-// the confirmation form by WhatsApp." That sentence is forwarded verbatim
-// on the confirmAction failure path in handleActionFlow, which is a pure
-// executeTool() call — it never goes near the LLM, so CAPABILITY_BOUNDARY_RULE
-// never gets a chance to catch it. This is the code-level enforcement of
-// that exact same boundary for this one bypass path.
 const UNSUPPORTED_CHANNEL_REGEX =
   /\b(whatsapp|email|e-?mail|sms|text message)\b/i;
 
@@ -406,16 +417,10 @@ function sanitizePmsMessage(text) {
   if (!looksLikeGuestReadableMessage(text)) return null;
   if (!UNSUPPORTED_CHANNEL_REGEX.test(text)) return text;
 
-  // Strip out only the sentence(s) referencing a channel we can't act on;
-  // keep any other substantive requirement in the message (e.g. "registration
-  // form must be submitted before check-in" is real, useful information —
-  // only the "...by WhatsApp" delivery promise is false).
   const sentences = text.split(/(?<=[.!?])\s+/);
   const kept = sentences.filter((s) => !UNSUPPORTED_CHANNEL_REGEX.test(s));
 
   if (kept.length === 0) {
-    // The whole message was just a channel-resend instruction — nothing
-    // substantive survives, so fall back to a generic, honest next step.
     return "This needs to be resolved at the front desk before check-in. Please contact them directly.";
   }
   return `${kept.join(" ")} Please contact the front desk directly for that.`.trim();
@@ -433,7 +438,6 @@ function buildConfirmationText({ fullName, email, phone }) {
   ].join("\n");
 }
 
-// Hotel names shown line by line, so the guest doesn't have to remember them.
 function buildAskHotelText(properties, isBooking) {
   const intro = isBooking
     ? "Which hotel would you like to reserve a room with?"
@@ -457,7 +461,6 @@ HOTEL SCOPE RULE:
   reservation lookup — those always reconfirm the hotel fresh (see ACTION HOTEL RULE below).
 `.trim();
 
-// ─── Action hotel rule (booking / cancel / check-in / check-out / lookup) ──
 const ACTION_HOTEL_RULE = `
 ACTION HOTEL RULE:
 - Every time the guest starts a NEW booking, cancellation, check-in, check-out, or reservation
@@ -469,7 +472,6 @@ ACTION HOTEL RULE:
   see the hotel already resolved by the time you're asked to act.
 `.trim();
 
-// ─── Property-scoped tools — code-level hard-stop ───────────────────────────
 const PROPERTY_SCOPED_TOOLS = new Set([
   "getOffers",
   "getReservation",
@@ -478,28 +480,6 @@ const PROPERTY_SCOPED_TOOLS = new Set([
   "cancelReservation",
 ]);
 
-// ═════════════════════════════════════════════════════════════════════════
-// Active Intent — SEMANTIC classification, not word-matching
-// ═════════════════════════════════════════════════════════════════════════
-// FIX — the previous version decided CANCEL / CHECK_IN / CHECK_OUT / LOOKUP /
-// BOOK purely from regex keyword matching. That breaks the moment the guest
-// phrases things differently, writes in another language, or misspells a
-// keyword ("tell me about my reservation", "give me my reservation dtail",
-// "quiero cancelar mi reserva", "storniere meine Buchung"). Regex can never
-// really capture MEANING.
-//
-// Fix: the regex below is now only a cheap, same-turn HINT — used purely to
-// let the "which hotel?" gate fire instantly for the extremely common
-// English keyword cases (so latency stays as good as it is now), and as a
-// last-resort fallback if the semantic classifier call fails outright (e.g.
-// network hiccup). The actual decision is made by the SAME utility-model
-// call that already runs on every turn for language detection
-// (analyzeGuestMessage below) — that call now also returns a semantic
-// `actionIntent` field (CANCEL / CHECK_IN / CHECK_OUT / LOOKUP / BOOK /
-// NONE), reasoning from the MEANING of the guest's message and the
-// conversation so far, in any language, regardless of exact wording or
-// spelling. No extra network round trip is added — it's the same call,
-// with one more field in its JSON response.
 const CANCEL_INTENT_REGEX = /\b(cancel|cancelling|cancellation)\b/i;
 const CHECKIN_INTENT_REGEX = /\b(check[\s-]?in|checking in)\b/i;
 const CHECKOUT_INTENT_REGEX = /\b(check[\s-]?out|checking out)\b/i;
@@ -509,17 +489,12 @@ const RESERVATION_NOUN_REGEX = /\b(reservation|booking)\b/i;
 const BOOK_VERB_REGEX = /\b(book|reserve)\b/i;
 const BOOK_INTENT_REGEX = /\b(book|reserve|reservation|booking)\b/i;
 
-// Cheap, same-turn hint only — never the final decision on its own. English
-// keyword patterns checked in priority order; anything it can't confidently
-// place is left null and deferred entirely to the semantic classifier.
 function regexIntentHint(text) {
   const t = text || "";
   if (CANCEL_INTENT_REGEX.test(t)) return "CANCEL";
   if (CHECKIN_INTENT_REGEX.test(t)) return "CHECK_IN";
   if (CHECKOUT_INTENT_REGEX.test(t)) return "CHECK_OUT";
   if (LOOKUP_INTENT_REGEX.test(t)) return "LOOKUP";
-  // Mentions "reservation/booking" with no explicit booking verb — much
-  // more often about an EXISTING reservation than a request for a new one.
   if (RESERVATION_NOUN_REGEX.test(t) && !BOOK_VERB_REGEX.test(t))
     return "LOOKUP";
   if (BOOK_INTENT_REGEX.test(t)) return "BOOK";
@@ -544,7 +519,6 @@ const INTENT_LABELS = {
     "The guest wants to see their existing reservation DETAILS/STATUS/ID — this is a read-only lookup, nothing gets modified.",
 };
 
-// ─── Date validation ────────────────────────────────────────────────────────
 function isPastDate(dateStr) {
   if (!dateStr) return false;
   const today = new Date();
@@ -555,7 +529,6 @@ function isPastDate(dateStr) {
   return check < today;
 }
 
-// ─── Deterministic keyword detection ───────────────────────────────────────
 const PASSCODE_REGEX =
   /passcode|pass code|door code|key code|access code|room code|entry code|unlock code/i;
 
@@ -563,9 +536,34 @@ const QUICK_REPEAT_REGEX =
   /\b(same (hotel|dates?|details?)|as before|as last time|again|quick reservation|repeat (the )?(same|last|previous))\b/i;
 const CHEAPEST_REGEX = /cheap/i;
 
-// ═════════════════════════════════════════════════════════════════════════
-// Fuzzy hotel matching
-// ═════════════════════════════════════════════════════════════════════════
+// ─── Post-decline classification (Problems 1-3, 9): after the guest says
+// "No" to a booking confirmation, these deterministically classify what
+// they want next WITHOUT involving the LLM, per the "deterministic flow"
+// requirement (Problem 10). ─────────────────────────────────────────────
+const WANTS_ANOTHER_ROOM_REGEX =
+  /\b(another room|different room|other room|change (the )?room|pick another|choose another|different offer|another offer|other offer|new room)\b/i;
+const WANTS_CANCEL_BOOKING_REGEX =
+  /\b(cancel (this|the|my)?\s*(booking|reservation)?|nevermind|never mind|forget it|don'?t want (it|this)|stop the booking|no longer want)\b/i;
+const MENTIONS_NAME_FIELD_REGEX = /\bname\b/i;
+const MENTIONS_EMAIL_FIELD_REGEX = /\bemail\b/i;
+const MENTIONS_PHONE_FIELD_REGEX = /\bphone|number\b/i;
+
+// Unsupported action requests (Problems 6-8): things the assistant has no
+// tool for at all. Detected deterministically so they never trigger the
+// hotel-verification gate.
+const PAYMENT_LINK_REGEX =
+  /\b(payment link|pay link|link to pay|send.*(pay|invoice)|invoice link)\b/i;
+const FEEDBACK_REGEX = /\b(feedback|complaint|review|suggestion box)\b/i;
+
+const FIELD_TO_STEP = { fullName: "name", email: "email", phone: "phone" };
+
+function getCorrectionAskSentence(field) {
+  if (field === "fullName") return ASK_CORRECTION_NAME_SENTENCE;
+  if (field === "email") return ASK_CORRECTION_EMAIL_SENTENCE;
+  if (field === "phone") return ASK_CORRECTION_PHONE_SENTENCE;
+  return ASK_NAME_SENTENCE;
+}
+
 const HOTEL_NAME_STOP_WORDS = new Set([
   "hotel",
   "the",
@@ -575,7 +573,6 @@ const HOTEL_NAME_STOP_WORDS = new Set([
   "at",
 ]);
 
-// Standard Levenshtein distance, iterative, no dependencies.
 function levenshtein(a, b) {
   const m = a.length;
   const n = b.length;
@@ -596,8 +593,6 @@ function levenshtein(a, b) {
   return dp[n];
 }
 
-// Tolerance scales with word length so short words ("Rome") don't accept
-// wild typos while longer ones ("Manchester") tolerate 2 edits.
 function fuzzyTolerance(len) {
   if (len <= 4) return 1;
   if (len <= 8) return 2;
@@ -607,13 +602,9 @@ function fuzzyTolerance(len) {
 function detectMentionedProperty(message, properties) {
   const lower = message.toLowerCase();
 
-  // Fast path: the guest typed the property's full name (or more).
   const exact = properties.find((p) => lower.includes(p.name.toLowerCase()));
   if (exact) return exact;
 
-  // Second path: match on the property's distinctive word(s), ignoring
-  // generic words like "hotel" — so a guest typing just "london" still
-  // matches "Hotel London".
   const exactWords = properties.find((p) => {
     const words = p.name
       .toLowerCase()
@@ -626,9 +617,6 @@ function detectMentionedProperty(message, properties) {
   });
   if (exactWords) return exactWords;
 
-  // Fuzzy path: typo tolerance via Levenshtein distance against each
-  // distinctive property word, compared to every token the guest typed.
-  // Handles "lonodn", "londn", "berln", "berin", "hotel londn", etc.
   const messageTokens = lower.split(/[^a-z0-9]+/).filter(Boolean);
   let best = null;
   let bestDistance = Infinity;
@@ -655,16 +643,16 @@ function detectMentionedProperty(message, properties) {
   return best;
 }
 
-// ─── Basic validators for the deterministic guest-detail flow ─────────────
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+// Fixed: added an upper bound. E.164 numbers max out at 15 digits — without
+// this, garbage input like "+920000000000000000" (18 digits) was silently
+// accepted as a "valid" phone number.
 function isValidPhone(input) {
   const digits = (input || "").replace(/[^\d]/g, "");
-  return digits.length >= 7;
+  return digits.length >= 7 && digits.length <= 15;
 }
 
-// ═════════════════════════════════════════════════════════════════════════
-// Natural date parsing
-// ═════════════════════════════════════════════════════════════════════════
 function pad2(n) {
   return String(n).padStart(2, "0");
 }
@@ -704,10 +692,6 @@ const MONTH_NAMES = {
   december: 12,
 };
 
-// Resolves a (month, day) pair to the nearest occurrence on/after today —
-// so "14 July" typed on 2026-07-10 becomes this July, but typed on
-// 2026-07-20 rolls forward to next year instead of silently returning a
-// past date.
 function nearestFutureDate(month, day, referenceDate = new Date()) {
   const y = referenceDate.getFullYear();
   if (!isRealDate(y, month, day)) return null;
@@ -730,7 +714,6 @@ function tryParseDateFast(input, referenceDate = new Date()) {
   const trimmed = (input || "").trim().toLowerCase();
   if (!trimmed) return null;
 
-  // ISO / slash numeric formats.
   let m = trimmed.match(/^(\d{4})[-/](\d{1,2})[-/](\d{1,2})$/);
   if (m) {
     const [, y, mo, d] = m.map(Number);
@@ -743,7 +726,6 @@ function tryParseDateFast(input, referenceDate = new Date()) {
     if (isRealDate(y, mo, d)) return `${y}-${pad2(mo)}-${pad2(d)}`;
   }
 
-  // Relative keywords.
   if (/^today$/.test(trimmed)) {
     const d = referenceDate;
     return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
@@ -754,7 +736,6 @@ function tryParseDateFast(input, referenceDate = new Date()) {
     return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
   }
 
-  // "14 July" / "14 Jul" / "14th July"
   m = trimmed.match(/^(\d{1,2})(?:st|nd|rd|th)?\s+([a-z]+)$/);
   if (m) {
     const day = Number(m[1]);
@@ -765,7 +746,6 @@ function tryParseDateFast(input, referenceDate = new Date()) {
     }
   }
 
-  // "July 14" / "Jul 14" / "July 14th"
   m = trimmed.match(/^([a-z]+)\s+(\d{1,2})(?:st|nd|rd|th)?$/);
   if (m) {
     const month = MONTH_NAMES[m[1]];
@@ -776,8 +756,6 @@ function tryParseDateFast(input, referenceDate = new Date()) {
     }
   }
 
-  // Bare day number ("14", "14th") — resolves against the guest's own
-  // "today" as known by the chatbot, exactly as requested.
   m = trimmed.match(/^(\d{1,2})(?:st|nd|rd|th)?$/);
   if (m) {
     const day = Number(m[1]);
@@ -805,28 +783,27 @@ async function parseDateSmart(input) {
     });
     const text = (res.text || "").trim();
     return /^\d{4}-\d{2}-\d{2}$/.test(text) ? text : null;
-  } catch {
+  } catch (err) {
+    logEvent(null, "parse_date_smart_failed", { error: err.message });
     return null;
   }
 }
 
-// ═════════════════════════════════════════════════════════════════════════
-// "Quick reservation in one message" pre-fill extraction
-// ═════════════════════════════════════════════════════════════════════════
 const EMAIL_EXTRACT_REGEX = /[^\s@]+@[^\s@]+\.[^\s@]+/;
 const PHONE_EXTRACT_REGEX = /\+?\d[\d\s-]{6,}\d/;
 const ADULTS_EXTRACT_REGEX =
   /\b(\d{1,2})\s*(adults?|guests?|people|persons?)\b/i;
-const NAME_EXTRACT_REGEX =
-  /\b(?:my (?:full )?name is|name[:\s]+is|i'?m|this is)\s+([a-zA-Z][a-zA-Z'\-]*(?:\s+[a-zA-Z][a-zA-Z'\-]*){0,3})/i;
 
-// Pulls a "DD[-/ ]DD Month" or "Month DD[-/ ]DD" range (e.g. "14-15 july",
-// "14 to 15 july") into two dates using the existing fast date parser, plus
-// falls back to two separately-mentioned dates anywhere in the message.
+// Fixed: was `name[:\s]+is` which required at least one space/colon between
+// "name" and "is", so a typo/no-space reply like "nameis usman" never
+// matched. Changed the middle group to `[:\s]*` (zero-or-more) so it still
+// catches the common typo'd form without loosening the other alternatives.
+const NAME_EXTRACT_REGEX =
+  /\b(?:my (?:full )?name is|name[:\s]*is|i'?m|this is)\s+([a-zA-Z][a-zA-Z'\-]*(?:\s+[a-zA-Z][a-zA-Z'\-]*){0,3})/i;
+
 function extractDateRangeFast(message, referenceDate = new Date()) {
   const trimmed = message.toLowerCase();
 
-  // "14-15 july" / "14 to 15 july" / "14th-15th july"
   let m = trimmed.match(
     /\b(\d{1,2})(?:st|nd|rd|th)?\s*(?:-|to|–|until)\s*(\d{1,2})(?:st|nd|rd|th)?\s+([a-z]+)\b/,
   );
@@ -840,8 +817,6 @@ function extractDateRangeFast(message, referenceDate = new Date()) {
     }
   }
 
-  // Two standalone dates anywhere in the message (numeric or "Month DD" form),
-  // e.g. "from 2026-07-14 to 2026-07-15" or "14 July to 16 July".
   const dateTokenRegex =
     /\b(\d{4}-\d{1,2}-\d{1,2}|\d{1,2}[-/]\d{1,2}[-/]\d{4}|\d{1,2}(?:st|nd|rd|th)?\s+[a-z]+|[a-z]+\s+\d{1,2}(?:st|nd|rd|th)?)\b/g;
   const found = [];
@@ -884,14 +859,53 @@ function extractQuickBookingDetails(message, referenceDate = new Date()) {
   return details;
 }
 
+// ─── NEW: correction-field extraction for the guest-detail confirmation
+// step. Unlike classifyConfirmationReply (which returns a single label),
+// this scans the guest's message directly for any email / phone / name
+// values they may have supplied inline (e.g. "no my email is X and phone is
+// Y and name is Z") so ALL corrections in one message can be applied at
+// once instead of only acting on whichever single field the classifier
+// happened to pick. ────────────────────────────────────────────────────────
+function extractCorrectionFields(message) {
+  const result = {};
+
+  const emailMatch = message.match(EMAIL_EXTRACT_REGEX);
+  if (emailMatch) {
+    const email = emailMatch[0].replace(/[.,;:!?]+$/, "");
+    if (EMAIL_REGEX.test(email)) result.email = email;
+  }
+
+  const phoneMatch = message.match(PHONE_EXTRACT_REGEX);
+  if (phoneMatch) {
+    const phone = phoneMatch[0].trim();
+    result.phoneAttempted = phone;
+    if (isValidPhone(phone)) result.phone = phone;
+  }
+
+  const nameMatch = message.match(NAME_EXTRACT_REGEX);
+  if (nameMatch) {
+    const fullName = nameMatch[1].trim();
+    if (fullName.length >= 2) result.fullName = fullName;
+  }
+
+  return result;
+}
+
 // ─── In-memory session store ───────────────────────────────────────────────
 const sessions = new Map();
 
 setInterval(
   () => {
     const cutoff = Date.now() - 2 * 60 * 60 * 1000;
+    let expired = 0;
     for (const [id, session] of sessions) {
-      if (session.createdAt < cutoff) sessions.delete(id);
+      if (session.createdAt < cutoff) {
+        sessions.delete(id);
+        expired++;
+      }
+    }
+    if (expired > 0) {
+      console.log(`[chatbot] event=session_cleanup expired=${expired} remaining=${sessions.size}`);
     }
   },
   15 * 60 * 1000,
@@ -899,6 +913,7 @@ setInterval(
 
 function getOrCreateSession(sessionId, chatbotId) {
   if (!sessions.has(sessionId)) {
+    logEvent(sessionId, "session_created", { chatbotId: shortId(chatbotId) });
     sessions.set(sessionId, {
       chatbotId,
       propertyId: null,
@@ -911,45 +926,17 @@ function getOrCreateSession(sessionId, chatbotId) {
       guestDetailStep: null,
       pendingGuestDetails: null,
       correctingField: false,
-      // Set right after asking "which hotel would you like to reserve a room
-      // with?" for a fresh booking request.
+      correctionQueue: null,
       awaitingHotelForBooking: false,
-      // Set right after asking "which hotel are you contacting?" for a
-      // non-booking action (check-in, check-out, cancellation, lookup) —
-      // mirrors awaitingHotelForBooking so the reply that follows is never
-      // re-classified and misrouted.
       awaitingHotelForAction: false,
       searchDetailStep: null,
       pendingSearchDetails: null,
       lastKnownLanguage: "English",
-      // The single source of truth for "what is the guest currently trying
-      // to do" (CANCEL / CHECK_IN / CHECK_OUT / LOOKUP / BOOK), decided
-      // SEMANTICALLY each turn by analyzeGuestMessage. Persists until the
-      // action completes, fails terminally, or the guest explicitly states
-      // a different intent.
       activeIntent: null,
-      // The last set of reservations getReservation returned when there was
-      // more than one match, so a follow-up like "last one" can be resolved
-      // deterministically without another RAG pass or a misrouted
-      // "I don't understand".
       lastReservations: null,
-      // ── Deterministic action flow (cancel / check-in / check-out / lookup) ──
-      // Mirrors guestDetailStep/searchDetailStep exactly: once this is set,
-      // handleWithProperties short-circuits BEFORE analyzeGuestMessage and
-      // BEFORE continueWithModel/runConversation, so the big tool-calling
-      // model is never invoked for these turns — same reason createBooking
-      // is fast.
-      // One of: null | "verifyPhone" | "verifyAlt" | "selectReservation" | "confirmAction"
       actionFlowStep: null,
-      // { phoneLast4?, roomNumber?, dateOfBirth? } collected so far this flow.
       pendingVerification: null,
-      // The single reservation resolved for this action, once known.
       resolvedActionReservation: null,
-      // Learned once per session so a second action (e.g. check-out right
-      // after check-in) never re-asks for verification — mirrors
-      // knownGuestDetails for bookings. NOTE: this reuses VERIFICATION only —
-      // the HOTEL is never reused this way, see ACTION_HOTEL_RULE / the
-      // `mentioned`-based gating in handleWithProperties below.
       knownVerification: null,
       createdAt: Date.now(),
     });
@@ -980,13 +967,7 @@ function selectRelevantChunks(
 
 // ─── Combined message analysis: intent + action-intent + language + English
 // query — ONE utility-model call per turn, doing all the semantic work. ────
-// FIX — this now also decides the action intent (CANCEL / CHECK_IN /
-// CHECK_OUT / LOOKUP / BOOK / NONE) from MEANING, not keywords, so
-// misspellings, unusual phrasing, and non-English messages all work the
-// same as a clean English keyword match. regexIntentHint is passed in only
-// as a same-turn hint (helps the model on ambiguous short replies) and as a
-// fallback if this call fails outright — it is never trusted on its own.
-async function analyzeGuestMessage(message, history, regexHint) {
+async function analyzeGuestMessage(message, history, regexHint, sessionId = null) {
   const recentHistory = history
     .filter((h) => typeof h.content === "string")
     .slice(-6);
@@ -1034,7 +1015,9 @@ they want to perform an action.
   present; judge from meaning.
 - "BOOK": the guest wants to make a brand NEW reservation that does not exist yet (e.g. "I want
   to book a room", "can I reserve for next weekend").
-- "NONE": intent is not "ACTION_REQUEST", or the action doesn't fit any of the above.
+- "NONE": intent is not "ACTION_REQUEST", or the action doesn't fit any of the above (e.g. the
+  guest wants to send feedback, get a payment link, or something else this assistant has no tool
+  for).
 ${
   regexHint && regexHint !== "NONE"
     ? `\nHINT (a cheap keyword scan detected a pattern matching ${regexHint} — this is only a weak same-turn signal, not a rule; use it as a tie-breaker ONLY if the message's actual meaning is genuinely ambiguous between two options, and ignore it entirely if the meaning clearly points elsewhere).`
@@ -1060,13 +1043,6 @@ punctuation, or keyword presence.
       .replace(/^```json\s*|\s*```$/g, "");
     const parsed = JSON.parse(raw);
 
-    // FIX — the model sometimes puts an action-intent label (LOOKUP, CANCEL,
-    // CHECK_IN, CHECK_OUT, BOOK) directly into the "intent" field instead of
-    // "actionIntent" (e.g. {"intent": "LOOKUP", "actionIntent": "NONE"}).
-    // Since none of those are valid "intent" values, the old code silently
-    // fell back to "NEW_QUESTION" — sending a genuine reservation lookup
-    // into RAG, which finds nothing and returns "I don't have information."
-    // Detect and correct that swap here before validating.
     if (VALID_ACTION_INTENTS.has(parsed.intent) && parsed.intent !== "NONE") {
       if (!parsed.actionIntent || parsed.actionIntent === "NONE") {
         parsed.actionIntent = parsed.intent;
@@ -1087,9 +1063,6 @@ punctuation, or keyword presence.
       ? parsed.actionIntent
       : "NONE";
     if (intent !== "ACTION_REQUEST") actionIntent = "NONE";
-    // Safety net: if the model said ACTION_REQUEST but somehow left
-    // actionIntent as NONE/invalid, fall back to the regex hint rather than
-    // losing the action entirely.
     if (
       intent === "ACTION_REQUEST" &&
       actionIntent === "NONE" &&
@@ -1108,12 +1081,20 @@ punctuation, or keyword presence.
         ? parsed.englishQuery.trim()
         : message;
 
+    logEvent(sessionId, "intent_analysis", {
+      intent,
+      actionIntent,
+      language,
+      regexHint: regexHint || "none",
+    });
+
     return { intent, actionIntent, language, englishQuery };
-  } catch {
-    // Model call failed outright — fall back fully to the deterministic
-    // regex hint so the conversation degrades gracefully instead of losing
-    // the guest's intent completely.
+  } catch (err) {
     const fallbackActionIntent = regexHint && regexHint !== "NONE" ? regexHint : "NONE";
+    logEvent(sessionId, "intent_analysis_failed", {
+      error: err.message,
+      fallbackActionIntent,
+    });
     return {
       intent: fallbackActionIntent !== "NONE" ? "ACTION_REQUEST" : "NEW_QUESTION",
       actionIntent: fallbackActionIntent,
@@ -1135,7 +1116,8 @@ async function translateToLanguage(fixedSentence, languageName) {
       model: UTILITY_MODEL,
     });
     return translation.text?.trim() || fixedSentence;
-  } catch {
+  } catch (err) {
+    logEvent(null, "translate_failed", { language: languageName, error: err.message });
     return fixedSentence;
   }
 }
@@ -1188,7 +1170,8 @@ punctuation, no explanation.
     const found = offers.find((o) => o.displayNumber === num);
     if (found) return { offer: found };
     return null;
-  } catch {
+  } catch (err) {
+    logEvent(null, "resolve_offer_failed", { error: err.message });
     return null;
   }
 }
@@ -1238,7 +1221,6 @@ function fastResolveReservationReference(message, reservations) {
     return reservations[0];
   }
 
-  // Status-word references, e.g. "the confirmed one", "the checked-in one".
   const statusMatch = reservations.find((r) => {
     const status = (r.status || "").toLowerCase().replace(/[\s-]/g, "");
     return status && trimmed.replace(/[\s-]/g, "").includes(status);
@@ -1284,41 +1266,60 @@ the message is not referring to any of these reservations. No punctuation, no ex
     const num = parseInt(label, 10);
     const found = reservations.find((r) => r.displayNumber === num);
     return found ? { reservation: found } : null;
-  } catch {
+  } catch (err) {
+    logEvent(null, "resolve_reservation_failed", { error: err.message });
     return null;
   }
 }
 
 // ═════════════════════════════════════════════════════════════════════════
-// Action-flow verification parsing: fast paths so cancel/check-in/
-// check-out/lookup never need to wait on the big tool-calling model just to
-// read 4 digits or a yes/no. Same philosophy as tryParseDateFast: a cheap
-// deterministic path first, LLM only when genuinely ambiguous.
+// Action-flow verification parsing
 // ═════════════════════════════════════════════════════════════════════════
-
-// "I forgot" / "don't have my phone" / etc. — switches to the alternative
-// verification method (room number + date of birth).
 const NO_PHONE_REGEX =
   /\b(don'?t have|forgot|don'?t know|can'?t find|no phone|lost my phone|not with me)\b/i;
 
-// Last 4 digits of a phone number. Accepts a bare "1234" or digits embedded
-// in a short sentence ("it's 1234", "the last 4 are 1234").
+// Loose (left-boundary only) mention detectors — used ONLY to catch the
+// guest explicitly naming a DIFFERENT action while a confirmation for
+// another action is still pending (see confirmAction below). Deliberately
+// more tolerant than CANCEL_INTENT_REGEX/CHECKIN_INTENT_REGEX/etc. so a
+// typo like "cancely" still registers as "cancel".
+function detectExplicitActionSwitch(message, currentActiveIntent) {
+  const t = message || "";
+  if (/\bcancel/i.test(t) && currentActiveIntent !== "CANCEL") return "CANCEL";
+  if (/\bcheck[\s-]?out/i.test(t) && currentActiveIntent !== "CHECK_OUT")
+    return "CHECK_OUT";
+  if (/\bcheck[\s-]?in/i.test(t) && currentActiveIntent !== "CHECK_IN")
+    return "CHECK_IN";
+  return null;
+}
+
+// ─── Mid-confirmation intent switch detector (final fix) ───────────────────
+// While the guest is being asked "Shall I check out / cancel / check in
+// now?", they may actually be typing a DIFFERENT action instead of
+// answering yes/no (e.g. "ok cancely my reservation" while a check-out
+// confirmation is pending). The word-boundary regexes used elsewhere
+// (CANCEL_INTENT_REGEX etc.) require an exact word match and miss common
+// typos like "cancely", so this uses loose substring matching instead —
+// deliberately narrower in scope (only used here, only to catch a genuine
+// intent switch) so it doesn't affect other classification paths.
+function detectCompetingActionIntent(message, currentIntent) {
+  const m = (message || "").toLowerCase();
+  if (currentIntent !== "CANCEL" && /cancel/.test(m)) return "CANCEL";
+  if (currentIntent !== "CHECK_OUT" && /check[\s-]?out/.test(m)) return "CHECK_OUT";
+  if (currentIntent !== "CHECK_IN" && /check[\s-]?in/.test(m)) return "CHECK_IN";
+  return null;
+}
+
 function extractPhoneLast4(message) {
   const digits = (message || "").replace(/[^\d]/g, "");
   if (digits.length < 4) return null;
   return digits.slice(-4);
 }
 
-// Confirmed field name against toolExecutor.js's getReservation: it
-// destructures `phoneLast4` directly onto the `phone_last4` query param.
 function buildPhoneVerificationInput(phoneLast4) {
   return { phoneLast4 };
 }
 
-// Date-of-birth parsing requires an explicit year (a birth date is always in
-// the past, sometimes decades back) — this deliberately does NOT reuse
-// nearestFutureDate/tryParseDateFast, which roll bare day/month toward the
-// nearest FUTURE date and would silently produce a wrong DOB.
 function tryParseDobFast(input) {
   const trimmed = (input || "").trim().toLowerCase();
   if (!trimmed) return null;
@@ -1358,10 +1359,6 @@ function tryParseDobFast(input) {
   return null;
 }
 
-// Mode C needs lastName + dateOfBirth + roomNumber ALL THREE together (per
-// toolDefinitions.js). If the guest already booked earlier in this session
-// we already know their last name — KNOWN DETAIL REUSE means we don't ask
-// for it again, only room number + DOB.
 function getKnownLastName(session) {
   const fullName =
     session.knownGuestDetails?.fullName ||
@@ -1412,23 +1409,15 @@ function extractRoomNumberToken(tokens) {
 }
 
 function extractLastNameToken(tokens) {
-  // A room-number-looking token is never the name; pick the longest purely
-  // alphabetic remaining token as the best guess for the surname.
   const nameCandidates = tokens.filter((t) => /^[a-z']{2,}$/i.test(t));
   if (nameCandidates.length === 0) return null;
   return nameCandidates.reduce((a, b) => (b.length > a.length ? b : a));
 }
 
-// Matches toolExecutor.js's getReservation exactly: Mode C requires
-// lastName + dateOfBirth + roomNumber sent together, nothing else.
 function buildAltVerificationInput({ lastName, roomNumber, dateOfBirth }) {
   return { lastName, roomNumber, dateOfBirth };
 }
 
-// Fast yes/no across a handful of common languages/scripts — covers the
-// overwhelming majority of confirmations instantly with zero model call.
-// Falls back to a one-shot utility-model classification only when this
-// returns null, exactly mirroring parseDateSmart's fast-path-then-LLM shape.
 const YES_WORDS_REGEX =
   /\b(yes|yeah|yep|yup|sure|ok(ay)?|go ahead|confirm(ed)?|correct|right|do it|please do|s[ií]|ja|oui|evet|haan|da|tak|si|ha)\b/i;
 const NO_WORDS_REGEX =
@@ -1458,7 +1447,8 @@ Reply with ONLY the single label, nothing else.
     });
     const label = (res.text || "").trim().toUpperCase();
     return ["YES", "NO"].includes(label) ? label : "UNCLEAR";
-  } catch {
+  } catch (err) {
+    logEvent(null, "yes_no_classify_failed", { error: err.message });
     return "UNCLEAR";
   }
 }
@@ -1469,7 +1459,6 @@ async function classifyYesNo(message, contextQuestion) {
   return await classifyYesNoLLM(message, contextQuestion);
 }
 
-// ─── Yes/No/Correction classifier for the booking confirmation step ───────
 async function classifyConfirmationReply(message) {
   try {
     const res = await chatWithTools({
@@ -1499,7 +1488,8 @@ Reply with ONLY the single label, nothing else.
       "CORRECTION_PHONE",
     ];
     return valid.includes(label) ? label : "UNCLEAR";
-  } catch {
+  } catch (err) {
+    logEvent(null, "confirmation_classify_failed", { error: err.message });
     return "UNCLEAR";
   }
 }
@@ -1527,17 +1517,6 @@ function buildToolResultEntries(toolCalls, toolResults) {
 // ═════════════════════════════════════════════════════════════════════════
 // Reservation response normalization
 // ═════════════════════════════════════════════════════════════════════════
-// toolExecutor.js's getReservation() returns the raw API JSON completely
-// untouched (unlike getOffers, which explicitly renames rate_plan_id ->
-// ratePlanId before handing it back). The rest of this API is snake_case
-// throughout (rate_plan_id, unit_group, total_amount in getOffers; the
-// booking-confirmed screenshot shows "Reservation ID"/"Guest ID" populated
-// from what is almost certainly reservation_id/guest_id) — so a getReservation
-// success response is very likely snake_case too, e.g. reservation_id /
-// guest_name / arrival / departure / status, possibly nested guest fields.
-// Checking only camelCase names here would silently treat a REAL match as
-// "not found," which is exactly the bug in the screenshots. pickFirst tries
-// every plausible key so a genuine match is recognized regardless of casing.
 function pickFirst(obj, keys) {
   if (!obj || typeof obj !== "object") return undefined;
   for (const key of keys) {
@@ -1550,18 +1529,6 @@ function pickFirst(obj, keys) {
 function normalizeReservation(raw) {
   if (!raw || typeof raw !== "object") return null;
 
-  // DEBUG — log the raw, unnormalized payload once per lookup so the exact
-  // field names the PMS actually returns are visible in the logs. If any
-  // field below still comes back "—" after this fix, check this log line
-  // for the real key name and add it to the pickFirst list for that field.
-  console.log("[normalizeReservation] RAW:", JSON.stringify(raw));
-
-  // FIX — confirmed via raw log: this PMS always nests arrival, departure,
-  // and the guest's real name under reservation_details (e.g.
-  // reservation_details.arrival, reservation_details.primaryGuest), while
-  // only reservation_id/guest_id/status live at the top level. Merge the
-  // nested object in (top-level values win on overlap, e.g. status) so every
-  // pickFirst lookup below can see both levels without duplicating logic.
   const nestedDetails =
     raw.reservation_details && typeof raw.reservation_details === "object"
       ? raw.reservation_details
@@ -1579,10 +1546,8 @@ function normalizeReservation(raw) {
     "reservationNumber",
     "reservation_number",
   ]);
-  if (!reservationId) return null; // Nothing usable to check-in/out/cancel against.
+  if (!reservationId) return null;
 
-  // FIX — guestId was never extracted at all; the guest's PMS guest id is
-  // needed for the reservation detail view alongside reservationId.
   let guestId = pickFirst(source, [
     "guestId",
     "guest_id",
@@ -1612,8 +1577,6 @@ function normalizeReservation(raw) {
         .join(" ") ||
       null;
   }
-  // Some PMS responses nest guest details one level deeper, e.g.
-  // { primaryGuest: {...} } or { booker: {...} } instead of { guest: {...} }.
   if (!guestName) {
     for (const key of ["primaryGuest", "booker", "reservationGuest"]) {
       if (source[key] && typeof source[key] === "object") {
@@ -1632,9 +1595,6 @@ function normalizeReservation(raw) {
     }
   }
 
-  // FIX — widened arrival/departure key list to cover more common API shapes
-  // (e.g. bare "checkin"/"checkout", "from"/"to", or a nested "stay" object)
-  // since the previous list left these blank for this PMS's actual response.
   let arrival = pickFirst(source, [
     "arrival",
     "arrival_date",
@@ -1668,9 +1628,6 @@ function normalizeReservation(raw) {
     reservationId: String(reservationId),
     guestId: guestId ? String(guestId) : null,
     guestName: guestName || null,
-    // FIX — this PMS returns full ISO timestamps (e.g.
-    // "2026-07-15T10:57:41+01:00"); trim to just the date for a clean
-    // guest-facing display instead of showing the time/timezone offset.
     arrival: arrival ? String(arrival).slice(0, 10) : null,
     departure: departure ? String(departure).slice(0, 10) : null,
     status:
@@ -1679,7 +1636,6 @@ function normalizeReservation(raw) {
   };
 }
 
-// Pulls whichever array-ish field the API might wrap multiple matches in.
 function getRawReservationArray(result) {
   if (!result) return null;
   const candidate =
@@ -1690,7 +1646,6 @@ function getRawReservationArray(result) {
   return Array.isArray(candidate) ? candidate : null;
 }
 
-// Multi-match case: 2+ reservations returned.
 function extractReservationList(result) {
   const arr = getRawReservationArray(result);
   if (!arr || arr.length <= 1) return null;
@@ -1698,8 +1653,6 @@ function extractReservationList(result) {
   return normalized.length > 1 ? normalized : null;
 }
 
-// Single-match case: exactly one reservation, however the API wrapped it
-// (a 1-item array, a { reservation: {...} } wrapper, or the bare object).
 function extractSingleReservation(result) {
   if (!result) return null;
   const arr = getRawReservationArray(result);
@@ -1719,6 +1672,14 @@ async function presentOffersOrAutoSelect({
   message,
   autoCheapest,
 }) {
+  logEvent(sessionId, "get_offers_request", {
+    property: property?.name,
+    arrival: params.arrival,
+    departure: params.departure,
+    adults: params.adults,
+    autoCheapest,
+  });
+
   const result = await executeTool({
     toolName: "getOffers",
     toolInput: params,
@@ -1727,6 +1688,7 @@ async function presentOffersOrAutoSelect({
   });
 
   if (!result?.offers || result.offers.length === 0) {
+    logEvent(sessionId, "get_offers_empty", { property: property?.name });
     const text = await translateToLanguage(NO_ROOMS_SENTENCE, lang);
     updateSession(sessionId, {
       history: [
@@ -1785,8 +1747,22 @@ async function enterGuestDetailFlow({
   updateSession(sessionId, { selectedOffer: offer });
   const refreshed = sessions.get(sessionId);
 
-  if (refreshed.knownGuestDetails) {
-    const details = { ...refreshed.knownGuestDetails };
+  const pendingComplete =
+    refreshed.pendingGuestDetails &&
+    refreshed.pendingGuestDetails.fullName &&
+    refreshed.pendingGuestDetails.email &&
+    refreshed.pendingGuestDetails.phone;
+
+  // Prefer details already collected earlier in THIS booking attempt (e.g.
+  // the guest picked a different room after declining a confirmation) over
+  // older knownGuestDetails from a previous completed booking.
+  const prefillDetails = pendingComplete
+    ? refreshed.pendingGuestDetails
+    : refreshed.knownGuestDetails;
+
+  if (prefillDetails) {
+    logEvent(sessionId, "guest_detail_prefilled", { offer: offer?.name });
+    const details = { ...prefillDetails };
     const text = await translateToLanguage(
       buildConfirmationText(details),
       lang,
@@ -1799,6 +1775,8 @@ async function enterGuestDetailFlow({
       ],
       pendingGuestDetails: details,
       guestDetailStep: "confirm",
+      correctingField: false,
+      correctionQueue: null,
     });
     return reply("text", { text });
   }
@@ -1826,6 +1804,8 @@ async function handleSearchDetailCollection({
   const step = session.searchDetailStep;
   const lang = session.lastKnownLanguage || "English";
   const pending = session.pendingSearchDetails || {};
+
+  logEvent(sessionId, "search_detail_step", { step });
 
   const send = async (fixedText, extraUpdates = {}) => {
     const translated = await translateToLanguage(fixedText, lang);
@@ -1910,6 +1890,8 @@ async function handleGuestDetailCollection({
   const lang = session.lastKnownLanguage || "English";
   const pending = session.pendingGuestDetails || {};
 
+  logEvent(sessionId, "guest_detail_step", { step });
+
   const send = async (fixedText, extraUpdates = {}) => {
     const translated = await translateToLanguage(fixedText, lang);
     const newHistory = [
@@ -1927,10 +1909,21 @@ async function handleGuestDetailCollection({
 
     const details = { ...pending, fullName };
     if (session.correctingField) {
+      const queue = session.correctionQueue || [];
+      if (queue.length > 0) {
+        const [nextField, ...rest] = queue;
+        return send(getCorrectionAskSentence(nextField), {
+          pendingGuestDetails: details,
+          guestDetailStep: FIELD_TO_STEP[nextField],
+          correctingField: true,
+          correctionQueue: rest,
+        });
+      }
       return send(buildConfirmationText(details), {
         pendingGuestDetails: details,
         guestDetailStep: "confirm",
         correctingField: false,
+        correctionQueue: null,
       });
     }
     return send(ASK_EMAIL_SENTENCE, {
@@ -1945,10 +1938,21 @@ async function handleGuestDetailCollection({
 
     const details = { ...pending, email };
     if (session.correctingField) {
+      const queue = session.correctionQueue || [];
+      if (queue.length > 0) {
+        const [nextField, ...rest] = queue;
+        return send(getCorrectionAskSentence(nextField), {
+          pendingGuestDetails: details,
+          guestDetailStep: FIELD_TO_STEP[nextField],
+          correctingField: true,
+          correctionQueue: rest,
+        });
+      }
       return send(buildConfirmationText(details), {
         pendingGuestDetails: details,
         guestDetailStep: "confirm",
         correctingField: false,
+        correctionQueue: null,
       });
     }
     return send(ASK_PHONE_SENTENCE, {
@@ -1962,15 +1966,76 @@ async function handleGuestDetailCollection({
     if (!isValidPhone(phone)) return send(INVALID_PHONE_SENTENCE);
 
     const details = { ...pending, phone };
+    if (session.correctingField) {
+      const queue = session.correctionQueue || [];
+      if (queue.length > 0) {
+        const [nextField, ...rest] = queue;
+        return send(getCorrectionAskSentence(nextField), {
+          pendingGuestDetails: details,
+          guestDetailStep: FIELD_TO_STEP[nextField],
+          correctingField: true,
+          correctionQueue: rest,
+        });
+      }
+    }
     return send(buildConfirmationText(details), {
       pendingGuestDetails: details,
       guestDetailStep: "confirm",
       correctingField: false,
+      correctionQueue: null,
     });
   }
 
   if (step === "confirm") {
+    // Fixed: previously we ALWAYS ran classifyConfirmationReply first, which
+    // returns only a single label (YES / NO / CORRECTION_NAME /
+    // CORRECTION_EMAIL / CORRECTION_PHONE / UNCLEAR). When the guest
+    // corrected multiple fields in one message (e.g. "no my email is X,
+    // phone is Y, name is Z"), only ONE field's correction was ever acted
+    // on, and the other values the guest already gave were discarded —
+    // forcing them to re-type a field they'd just supplied.
+    //
+    // Now we scan the message directly for any valid email/phone/name the
+    // guest supplied inline. If we find any, we apply ALL of them at once
+    // and re-show the confirmation immediately, instead of asking again.
+    const extracted = extractCorrectionFields(message);
+    const hasValidCorrection = Boolean(
+      extracted.email || extracted.phone || extracted.fullName,
+    );
+
+    if (hasValidCorrection) {
+      const details = { ...pending };
+      if (extracted.fullName) details.fullName = extracted.fullName;
+      if (extracted.email) details.email = extracted.email;
+      if (extracted.phone) details.phone = extracted.phone;
+
+      logEvent(sessionId, "guest_detail_multi_correction", {
+        correctedFields: Object.keys(extracted).filter((k) =>
+          ["fullName", "email", "phone"].includes(k),
+        ),
+      });
+
+      // Guest attempted to correct the phone number too, but what they gave
+      // isn't a valid phone — apply the corrections that ARE valid, but ask
+      // specifically for a usable phone number instead of silently keeping
+      // the old (possibly also wrong) one or accepting garbage.
+      if (extracted.phoneAttempted && !extracted.phone) {
+        return send(INVALID_PHONE_SENTENCE, {
+          pendingGuestDetails: details,
+          guestDetailStep: "phone",
+          correctingField: true,
+        });
+      }
+
+      return send(buildConfirmationText(details), {
+        pendingGuestDetails: details,
+        guestDetailStep: "confirm",
+        correctingField: false,
+      });
+    }
+
     const label = await classifyConfirmationReply(message);
+    logEvent(sessionId, "booking_confirmation_classified", { label });
 
     if (label === "YES") {
       const params = session.lastSearchParams;
@@ -1982,6 +2047,10 @@ async function handleGuestDetailCollection({
         !pending.email ||
         !pending.phone
       ) {
+        logEvent(sessionId, "booking_confirm_missing_state", {
+          hasParams: Boolean(params),
+          hasOffer: Boolean(offer),
+        });
         return send(NO_SEARCH_STATE_SENTENCE, {
           guestDetailStep: null,
           pendingGuestDetails: null,
@@ -2009,8 +2078,14 @@ async function handleGuestDetailCollection({
       });
 
       if (!result || result.success === false) {
+        logEvent(sessionId, "booking_failed", { error: result?.error });
         return send(BOOKING_FAILED_SENTENCE, { guestDetailStep: "confirm" });
       }
+
+      logEvent(sessionId, "booking_confirmed", {
+        reservationId: result?.reservationId || result?.reservation_id,
+        property: property?.name,
+      });
 
       const confirmText = await translateToLanguage(
         BOOKING_CONFIRMED_SENTENCE,
@@ -2039,10 +2114,12 @@ async function handleGuestDetailCollection({
     }
 
     if (label === "NO") {
+      // Problem 1 & 9: do NOT clear selectedOffer, pendingGuestDetails,
+      // lastOffers, or lastSearchParams here — the booking session must
+      // stay alive so the guest can correct details, pick a different
+      // room, or explicitly cancel next.
       return send(BOOKING_CANCELLED_SENTENCE, {
-        guestDetailStep: null,
-        pendingGuestDetails: null,
-        selectedOffer: null,
+        guestDetailStep: "postDecline",
       });
     }
 
@@ -2065,6 +2142,112 @@ async function handleGuestDetailCollection({
     return send(UNCLEAR_CONFIRMATION_SENTENCE);
   }
 
+  if (step === "postDecline") {
+    // Priority 1: the guest supplied actual new values inline (e.g. "my
+    // email is X and phone is Y") — apply all of them at once and go
+    // straight back to the full confirmation card (Problem 2).
+    const extracted = extractCorrectionFields(message);
+    const hasValidCorrection = Boolean(
+      extracted.email || extracted.phone || extracted.fullName,
+    );
+
+    if (hasValidCorrection) {
+      const details = { ...pending };
+      if (extracted.fullName) details.fullName = extracted.fullName;
+      if (extracted.email) details.email = extracted.email;
+      if (extracted.phone) details.phone = extracted.phone;
+
+      logEvent(sessionId, "post_decline_multi_correction", {
+        correctedFields: Object.keys(extracted).filter((k) =>
+          ["fullName", "email", "phone"].includes(k),
+        ),
+      });
+
+      if (extracted.phoneAttempted && !extracted.phone) {
+        return send(INVALID_PHONE_SENTENCE, {
+          pendingGuestDetails: details,
+          guestDetailStep: "phone",
+          correctingField: true,
+          correctionQueue: [],
+        });
+      }
+
+      return send(buildConfirmationText(details), {
+        pendingGuestDetails: details,
+        guestDetailStep: "confirm",
+        correctingField: false,
+        correctionQueue: null,
+      });
+    }
+
+    // Priority 2: guest wants a different room (Problem 3) — re-show the
+    // SAME previously fetched offers, no new search, no hotel re-ask.
+    if (WANTS_ANOTHER_ROOM_REGEX.test(message)) {
+      if (!session.lastOffers || session.lastOffers.length === 0) {
+        return send(NO_SEARCH_STATE_SENTENCE, {
+          guestDetailStep: null,
+          pendingGuestDetails: null,
+          selectedOffer: null,
+          correctingField: false,
+          correctionQueue: null,
+        });
+      }
+      logEvent(sessionId, "post_decline_change_room", {});
+      const text = await translateToLanguage(OFFERS_INTRO_SENTENCE, lang);
+      updateSession(sessionId, {
+        history: [
+          ...session.history,
+          { role: "user", content: message },
+          { role: "assistant", content: text },
+        ],
+        guestDetailStep: null,
+        selectedOffer: null,
+        correctingField: false,
+        correctionQueue: null,
+      });
+      return reply("offers", { text, data: session.lastOffers });
+    }
+
+    // Priority 3: guest explicitly wants to cancel the booking outright —
+    // only NOW is it safe to clear the booking state (Problem 9).
+    if (WANTS_CANCEL_BOOKING_REGEX.test(message)) {
+      logEvent(sessionId, "post_decline_cancel", {});
+      return send(BOOKING_CANCELLED_FINAL_SENTENCE, {
+        guestDetailStep: null,
+        pendingGuestDetails: null,
+        selectedOffer: null,
+        lastOffers: null,
+        lastSearchParams: null,
+        correctingField: false,
+        correctionQueue: null,
+      });
+    }
+
+    // Priority 4: guest names which field(s) are wrong without giving new
+    // values yet (e.g. "my email and phone number are wrong") — queue them
+    // and ask for each value in turn, ending on the full confirmation card.
+    const fieldsToAsk = [];
+    if (MENTIONS_NAME_FIELD_REGEX.test(message)) fieldsToAsk.push("fullName");
+    if (MENTIONS_EMAIL_FIELD_REGEX.test(message)) fieldsToAsk.push("email");
+    if (MENTIONS_PHONE_FIELD_REGEX.test(message)) fieldsToAsk.push("phone");
+
+    if (fieldsToAsk.length > 0) {
+      const [first, ...rest] = fieldsToAsk;
+      logEvent(sessionId, "post_decline_field_correction_queued", {
+        fields: fieldsToAsk.join(","),
+      });
+      return send(getCorrectionAskSentence(first), {
+        guestDetailStep: FIELD_TO_STEP[first],
+        correctingField: true,
+        correctionQueue: rest,
+      });
+    }
+
+    // Priority 5: unclear — re-ask the same deterministic prompt. State
+    // stays untouched (still "postDecline").
+    return send(BOOKING_CANCELLED_SENTENCE);
+  }
+
   return send(ASK_NAME_SENTENCE, {
     guestDetailStep: "name",
     pendingGuestDetails: {},
@@ -2074,24 +2257,17 @@ async function handleGuestDetailCollection({
 // ═════════════════════════════════════════════════════════════════════════
 // Deterministic action flow (cancel / check-in / check-out / lookup)
 // ═════════════════════════════════════════════════════════════════════════
-// This is the direct counterpart to handleGuestDetailCollection for booking.
-// Every step here is either a regex/parse check or a single executeTool
-// call — chatWithTools/runConversation (the big reasoning model) is NEVER
-// invoked. The only model calls left are cheap UTILITY_MODEL one-shots, and
-// only when a fast deterministic path genuinely can't decide (ambiguous
-// yes/no, a descriptive reservation reference) — exactly the pattern
-// tryParseDateFast + parseDateSmart already uses for dates.
-//
-// LOOKUP shares this entire flow (verification, reservation resolution) with
-// CANCEL/CHECK_IN/CHECK_OUT — the only difference is the terminal step: once
-// a single reservation is resolved, LOOKUP shows its details and ends the
-// flow immediately, instead of asking "shall I cancel/check-in/check-out
-// now?" (see the two `activeIntent === "LOOKUP"` branches below).
 async function handleActionFlow({ sessionId, message, session, property }) {
   const lang = session.lastKnownLanguage || "English";
   const activeIntent = session.activeIntent;
   const step = session.actionFlowStep;
   const pending = session.pendingVerification || {};
+
+  logEvent(sessionId, "action_flow_step", {
+    activeIntent,
+    step: step || "start",
+    property: property?.name,
+  });
 
   const send = async (fixedText, extraUpdates = {}) => {
     const translated = await translateToLanguage(fixedText, lang);
@@ -2104,10 +2280,6 @@ async function handleActionFlow({ sessionId, message, session, property }) {
     return reply("text", { text: translated });
   };
 
-  // Runs getReservation directly (no big model) and routes to the right
-  // next step based on how many matches came back. `viaStep` records which
-  // verification method produced this lookup, so a NOT_FOUND result reverts
-  // to re-asking THAT method — not always the default phone step.
   const lookupAndAdvance = async (toolInput, viaStep) => {
     const result = await executeTool({
       toolName: "getReservation",
@@ -2117,6 +2289,7 @@ async function handleActionFlow({ sessionId, message, session, property }) {
     });
 
     if (!result || result.success === false) {
+      logEvent(sessionId, "reservation_lookup_not_found", { viaStep, error: result?.error });
       return send(RESERVATION_NOT_FOUND_SENTENCE, {
         actionFlowStep: viaStep,
         pendingVerification: {},
@@ -2126,6 +2299,7 @@ async function handleActionFlow({ sessionId, message, session, property }) {
 
     const list = extractReservationList(result);
     if (list) {
+      logEvent(sessionId, "reservation_lookup_multi_match", { count: list.length });
       const numbered = list.map((r, i) => ({ ...r, displayNumber: i + 1 }));
       updateSession(sessionId, { lastReservations: numbered });
       return send(buildReservationListText(numbered), {
@@ -2136,6 +2310,7 @@ async function handleActionFlow({ sessionId, message, session, property }) {
 
     const reservation = extractSingleReservation(result);
     if (!reservation) {
+      logEvent(sessionId, "reservation_normalize_failed", { viaStep });
       return send(RESERVATION_NOT_FOUND_SENTENCE, {
         actionFlowStep: viaStep,
         pendingVerification: {},
@@ -2143,8 +2318,11 @@ async function handleActionFlow({ sessionId, message, session, property }) {
       });
     }
 
-    // LOOKUP has nothing to confirm or modify — show the details directly
-    // and end the flow, instead of asking "shall I proceed?".
+    logEvent(sessionId, "reservation_resolved", {
+      reservationId: reservation.reservationId,
+      activeIntent,
+    });
+
     if (activeIntent === "LOOKUP") {
       return send(buildReservationDetailText(reservation), {
         actionFlowStep: null,
@@ -2162,11 +2340,6 @@ async function handleActionFlow({ sessionId, message, session, property }) {
     });
   };
 
-  // ── Step 0: nothing started yet — reuse known verification if we already
-  // have it from earlier in this session (KNOWN DETAIL REUSE), otherwise ask
-  // for the default method (phone last 4). Note: verification is reused, but
-  // the HOTEL is never reused this way — property is always resolved by the
-  // caller (handleWithProperties) fresh for this specific request. ──
   if (!step) {
     if (session.knownVerification?.phoneLast4) {
       return await lookupAndAdvance(
@@ -2211,11 +2384,6 @@ async function handleActionFlow({ sessionId, message, session, property }) {
     );
   }
 
-  // Mode C requires lastName + dateOfBirth + roomNumber TOGETHER — the real
-  // tool schema rejects a call missing any of the three. If the guest's name
-  // is already known from an earlier booking this session, we reuse it
-  // (KNOWN DETAIL REUSE) and only need room number + DOB from this reply;
-  // otherwise all three must be parsed out of the guest's message.
   if (step === "verifyAlt") {
     const knownLastName = getKnownLastName(session);
     const { dateOfBirth, remainder } = extractDobAndRemainder(message);
@@ -2274,10 +2442,35 @@ async function handleActionFlow({ sessionId, message, session, property }) {
       });
     }
 
+    const switchedIntent = detectExplicitActionSwitch(message, activeIntent);
+    if (switchedIntent) {
+      logEvent(sessionId, "action_intent_switched_mid_confirm", {
+        from: activeIntent,
+        to: switchedIntent,
+      });
+
+      if (switchedIntent === "LOOKUP") {
+        return send(buildReservationDetailText(reservation), {
+          actionFlowStep: null,
+          pendingVerification: null,
+          resolvedActionReservation: null,
+          activeIntent: null,
+          lastReservations: null,
+        });
+      }
+
+      return send(buildActionConfirmText(switchedIntent, reservation), {
+        actionFlowStep: "confirmAction",
+        resolvedActionReservation: reservation,
+        activeIntent: switchedIntent,
+      });
+    }
+
     const label = await classifyYesNo(
       message,
       buildActionConfirmText(activeIntent, reservation),
     );
+    logEvent(sessionId, "action_confirmation_classified", { label, activeIntent });
 
     if (label === "NO") {
       return send(ACTION_ABORTED_SENTENCE, {
@@ -2289,10 +2482,6 @@ async function handleActionFlow({ sessionId, message, session, property }) {
     }
 
     if (label !== "YES") {
-      // The guest asked about the reservation itself ("give me the detail
-      // about my reservation status") rather than answering yes/no — we
-      // already have the resolved reservation in memory, so answer directly
-      // and then re-ask, instead of ignoring what they actually said.
       if (RESERVATION_INFO_QUERY_REGEX.test(message)) {
         const detail = buildReservationDetailText(reservation);
         const reask = buildActionConfirmText(activeIntent, reservation);
@@ -2302,28 +2491,38 @@ async function handleActionFlow({ sessionId, message, session, property }) {
     }
 
     const toolName = ACTION_TOOL_NAME[activeIntent];
+    if (!toolName) {
+      logEvent(sessionId, "action_tool_unrecognized", { activeIntent });
+      return send(ACTION_UNRECOGNIZED_SENTENCE, {
+        actionFlowStep: null,
+        pendingVerification: null,
+        resolvedActionReservation: null,
+        activeIntent: null,
+      });
+    }
+
     const result = await executeTool({
       toolName,
-      // Matches toolExecutor.js exactly: checkIn/checkOut/cancelReservation
-      // all destructure `reservationId` from toolInput.
       toolInput: { reservationId: reservation.reservationId },
       session,
       property,
     });
 
     if (!result || result.success === false) {
-      // Surface the PMS's own reason (e.g. "Check-in not allowed before
-      // 14:00 on arrival day") when it looks like a real, guest-readable
-      // sentence — that's exactly the information the guest needs. But
-      // strip out any promise of a delivery channel (WhatsApp/email/SMS)
-      // this chatbot has no tool to fulfill — see CAPABILITY_BOUNDARY_RULE
-      // and sanitizePmsMessage above; this path bypasses the LLM entirely,
-      // so the sanitizing must happen here, at the code level. Fall back to
-      // the generic message if the API gave us nothing usable.
+      logEvent(sessionId, "action_execute_failed", {
+        toolName,
+        reservationId: reservation.reservationId,
+        error: result?.error,
+      });
       const pmsReason = result?.error;
       const text = sanitizePmsMessage(pmsReason) || ACTION_FAILED_SENTENCE;
       return send(text, { actionFlowStep: "confirmAction" });
     }
+
+    logEvent(sessionId, "action_execute_success", {
+      toolName,
+      reservationId: reservation.reservationId,
+    });
 
     const successText = ACTION_SUCCESS_SENTENCES[activeIntent] || "Done.";
     return send(successText, {
@@ -2334,7 +2533,6 @@ async function handleActionFlow({ sessionId, message, session, property }) {
     });
   }
 
-  // Fallback: unknown step — restart the flow rather than getting stuck.
   return send(ASK_PHONE_VERIFY_SENTENCE, {
     actionFlowStep: "verifyPhone",
     pendingVerification: {},
@@ -2353,15 +2551,40 @@ async function runConversation({
 }) {
   let currentHistory = history;
   let currentProperty = property;
+  const lang = session.lastKnownLanguage || "English";
+  let loopCount = 0;
 
   while (true) {
-    const response = await chatWithTools({
-      systemPrompt,
-      history: currentHistory,
-      tools,
-    });
+    loopCount++;
+    if (loopCount > 6) {
+      // Safety valve — should never happen, but prevents a runaway tool-call
+      // loop from hanging a turn forever if the model keeps requesting tools.
+      logEvent(sessionId, "run_conversation_loop_limit", { loopCount });
+      const text = await translateToLanguage(LLM_FAILURE_SENTENCE, lang);
+      updateSession(sessionId, {
+        history: [...currentHistory, { role: "assistant", content: text }],
+      });
+      return reply("text", { text });
+    }
+
+    let response;
+    try {
+      response = await chatWithTools({
+        systemPrompt,
+        history: currentHistory,
+        tools,
+      });
+    } catch (err) {
+      logEvent(sessionId, "llm_call_failed", { loopCount, error: err.message });
+      const text = await translateToLanguage(LLM_FAILURE_SENTENCE, lang);
+      updateSession(sessionId, {
+        history: [...currentHistory, { role: "assistant", content: text }],
+      });
+      return reply("text", { text });
+    }
 
     if (!response.toolCalls || response.toolCalls.length === 0) {
+      logEvent(sessionId, "llm_final_text", { loopCount });
       updateSession(sessionId, {
         history: [
           ...currentHistory,
@@ -2370,6 +2593,11 @@ async function runConversation({
       });
       return reply("text", { text: response.text });
     }
+
+    logEvent(sessionId, "llm_tool_calls", {
+      loopCount,
+      tools: response.toolCalls.map((tc) => tc.name).join(","),
+    });
 
     const toolResults = [];
 
@@ -2421,12 +2649,22 @@ async function runConversation({
         continue;
       }
 
-      const result = await executeTool({
-        toolName: toolCall.name,
-        toolInput: toolCall.input,
-        session,
-        property: currentProperty,
-      });
+      let result;
+      try {
+        result = await executeTool({
+          toolName: toolCall.name,
+          toolInput: toolCall.input,
+          session,
+          property: currentProperty,
+        });
+      } catch (err) {
+        logEvent(sessionId, "execute_tool_threw", {
+          toolName: toolCall.name,
+          propertyId: currentProperty?.propertyId,
+          error: err.message,
+        });
+        result = { success: false, error: "Request failed. Please try again." };
+      }
       toolResults.push({ toolCallId: toolCall.id, result });
 
       if (toolCall.name === "getOffers") {
@@ -2466,9 +2704,6 @@ async function runConversation({
         });
       }
 
-      // Capture a multi-match reservation list so the NEXT guest message
-      // ("last one") can be resolved deterministically instead of falling
-      // through to RAG and hitting the generic no-info refusal.
       if (toolCall.name === "getReservation") {
         const list = extractReservationList(result);
         if (list) {
@@ -2479,8 +2714,6 @@ async function runConversation({
           result.reservations = numberedReservations;
           updateSession(sessionId, { lastReservations: numberedReservations });
         } else {
-          // A single, unambiguous match resolves the reference automatically —
-          // clear any stale list from an earlier lookup.
           updateSession(sessionId, { lastReservations: null });
         }
       }
@@ -2516,6 +2749,7 @@ async function handleDocumentOnlySession({
     message,
     session.history,
     null,
+    sessionId,
   );
   const isSmallTalk = intent === "SMALL_TALK";
 
@@ -2534,6 +2768,13 @@ async function handleDocumentOnlySession({
     },
   );
   const hasContext = relevantChunks.length > 0;
+
+  logEvent(sessionId, "rag_result", {
+    scope: "document_only",
+    retrieved: ragChunks.length,
+    used: relevantChunks.length,
+    usedFallback,
+  });
 
   const history = [...session.history, { role: "user", content: message }];
 
@@ -2615,9 +2856,6 @@ ${ragContext}
 }
 
 // ─── Shared: RAG lookup + system prompt + big-model tool-calling turn. ─────
-// Used both by the normal post-classification path and by the
-// awaitingHotelForAction shortcut (which forces intent=FOLLOW_UP so this
-// turn is never re-classified after the guest has just named the hotel).
 async function continueWithModel({
   sessionId,
   chatbotId,
@@ -2637,9 +2875,6 @@ async function continueWithModel({
 
   const history = [...session.history, { role: "user", content: message }];
 
-  // ── Hotel-first hard stop for non-booking actions — only ask if NO hotel is
-  // confirmed at all. Sets awaitingHotelForAction so the next turn (naming
-  // the hotel) is handled deterministically instead of re-classified. ──
   if (isActionRequest && !effectiveProperty) {
     const text = await translateToLanguage(
       buildAskHotelText(properties, false),
@@ -2652,10 +2887,6 @@ async function continueWithModel({
     return reply("text", { text });
   }
 
-  // Any conversational turn — small talk, a follow-up reply (phone digits,
-  // DOB, a bare hotel name answering the hotel gate), or a fresh action
-  // request — has no factual content to look up, so RAG is skipped for
-  // these. Only a genuine NEW_QUESTION needs RAG.
   let ragChunks = [];
   let usedGeneralFallback = false;
   let relevantChunks = [];
@@ -2700,6 +2931,14 @@ async function continueWithModel({
     }
 
     hasContext = relevantChunks.length > 0;
+
+    logEvent(sessionId, "rag_result", {
+      scope: effectiveProperty ? "property" : "general",
+      retrieved: ragChunks.length,
+      used: relevantChunks.length,
+      usedFallback,
+      usedGeneralFallback,
+    });
   }
 
   const contextLabel =
@@ -2770,17 +3009,10 @@ RAG CONCISENESS — MOST IMPORTANT RULE for factual answers, applies above all e
     ? `Hotel: ${effectiveProperty.name} (currently confirmed for this conversation)\nAddress: ${effectiveProperty.address}`
     : `No hotel confirmed yet for this conversation. Do NOT ask which hotel just to answer a question — only ask if the guest is trying to use a hotel-specific tool (see TOOL RULE and HOTEL SCOPE RULE below).`;
 
-  // Surface the persisted active intent directly in the prompt, so the
-  // model has an explicit anchor and never silently drifts into a different
-  // flow (e.g. booking) just because a later message happens to contain a
-  // hotel name.
   const activeIntentBlock = session.activeIntent
     ? `ACTIVE INTENT (do not deviate from this without the guest explicitly changing it): ${INTENT_LABELS[session.activeIntent] || session.activeIntent}`
     : "";
 
-  // Tell the model exactly which reservation was resolved this turn, if the
-  // guest's message matched one from the last multi-match list — this is
-  // what lets "last one" work instead of "I don't understand".
   let resolvedReservationBlock = "";
   if (session.lastReservations) {
     const resolution = await resolveReservationSelection(
@@ -2797,18 +3029,14 @@ reservationId: ${r.reservationId || r.id}, guest: ${r.guestName || "unknown"}, d
     }
   }
 
-  // Extreme latency reduction for active-intent turns: when the guest is
-  // mid-flow on cancel/check-in/check-out (session.activeIntent set) and
-  // there's no RAG content to answer with, none of the factual-answering
-  // rules (HOTEL_SCOPE_RULE, BASIC_FORMAT_RULE, the enumeration/multi-part
-  // formatting instructions, the "CONCISENESS for factual answers" block,
-  // hotel-switch wording) do anything useful — they exist to govern how the
-  // model answers guest QUESTIONS, and this turn isn't one. Every token in
-  // the system prompt costs processing time before the model can even start
-  // generating, so a pure action-flow turn gets a deliberately short prompt
-  // instead of the full one. NEW_QUESTION turns and any turn with RAG
-  // context still get the complete prompt, unchanged.
   const isPureActionFlow = !hasContext && isConversational;
+
+  logEvent(sessionId, "continue_with_model", {
+    intent,
+    isPureActionFlow,
+    hasContext,
+    property: effectiveProperty?.name || "none",
+  });
 
   const systemPrompt = isPureActionFlow
     ? `
@@ -2889,11 +3117,6 @@ ${ragContext}
 // ═════════════════════════════════════════════════════════════════════════
 // Narrow the tool array by active intent
 // ═════════════════════════════════════════════════════════════════════════
-// Since session.activeIntent already tells us exactly what the guest is
-// doing (CANCEL / CHECK_IN / CHECK_OUT / LOOKUP), we can safely narrow the
-// tool array to just the tools that flow could ever need, without touching
-// architecture, RAG, or removing multi-tool support for BOOK / no-active-
-// intent turns (which still get the full array, unchanged).
 const INTENT_TOOL_NAMES = {
   CANCEL: ["getReservation", "cancelReservation"],
   CHECK_IN: ["getReservation", "checkIn"],
@@ -2904,16 +3127,12 @@ const INTENT_TOOL_NAMES = {
 function getToolsForIntent(activeIntent) {
   const fullSet = [...toolDefinitions.all, toolDefinitions.selectProperty];
   const allowedList = activeIntent && INTENT_TOOL_NAMES[activeIntent];
-  if (!allowedList) return fullSet; // BOOK, null, or unknown intents keep the full toolset.
+  if (!allowedList) return fullSet;
 
   const allowedNames = new Set([...allowedList, "selectProperty"]);
-  // Tool defs are OpenAI-style: { type: "function", function: { name, ... } }.
   const narrowed = fullSet.filter((t) =>
     allowedNames.has(t?.function?.name ?? t?.name),
   );
-  // Safety net: if the tool-definition shape doesn't match what we expect and
-  // filtering wipes the list out, fall back to the full set rather than
-  // silently handing the model zero tools.
   return narrowed.length > 0 ? narrowed : fullSet;
 }
 
@@ -2945,8 +3164,8 @@ async function handleWithProperties({
     return reply("text", { text: "What would you like to know?" });
   }
 
-  // ── Room passcode: this feature no longer exists — refuse immediately. ──
   if (PASSCODE_REGEX.test(message)) {
+    logEvent(sessionId, "passcode_request_refused", {});
     const lang = currentSession.lastKnownLanguage || "English";
     const text = await translateToLanguage(PASSCODE_REFUSAL_SENTENCE, lang);
     updateSession(sessionId, {
@@ -2965,6 +3184,11 @@ async function handleWithProperties({
     properties.find((p) => p.propertyId === currentSession.propertyId) ||
     null;
 
+  logEvent(sessionId, "property_resolved", {
+    mentioned: mentioned?.name || "none",
+    effective: effectiveProperty?.name || "none",
+  });
+
   if (mentioned && mentioned.propertyId !== currentSession.propertyId) {
     updateSession(sessionId, {
       propertyId: mentioned.propertyId,
@@ -2973,11 +3197,6 @@ async function handleWithProperties({
     });
   }
 
-  // ── "Same hotel, same dates, same details" — reuse the last booking's hotel
-  // and search params from this session instead of asking again. This is an
-  // explicit, guest-stated exception ("same as before") to the "always ask
-  // fresh" rule below — the guest is deliberately asking to repeat, not
-  // starting a new, potentially different request. ──
   if (
     QUICK_REPEAT_REGEX.test(message) &&
     currentSession.propertyId &&
@@ -2989,6 +3208,7 @@ async function handleWithProperties({
     const params = currentSession.lastSearchParams;
 
     if (repeatProperty && !isPastDate(params.arrival)) {
+      logEvent(sessionId, "quick_repeat_booking", { property: repeatProperty.name });
       const lang = currentSession.lastKnownLanguage || "English";
       updateSession(sessionId, {
         awaitingHotelForBooking: false,
@@ -3009,7 +3229,6 @@ async function handleWithProperties({
     }
   }
 
-  // ── The app just asked which hotel for a fresh booking request. ──
   if (currentSession.awaitingHotelForBooking) {
     const lang = currentSession.lastKnownLanguage || "English";
 
@@ -3028,6 +3247,7 @@ async function handleWithProperties({
       return reply("text", { text });
     }
 
+    logEvent(sessionId, "route", { branch: "booking_hotel_confirmed", property: mentioned.name });
     const text = await translateToLanguage(ASK_ARRIVAL_SENTENCE, lang);
     updateSession(sessionId, {
       awaitingHotelForBooking: false,
@@ -3042,13 +3262,6 @@ async function handleWithProperties({
     return reply("text", { text });
   }
 
-  // ── The app just asked which hotel for a non-booking action (check-in,
-  // check-out, cancellation, or reservation lookup). Once the guest names
-  // the hotel, hand off straight into the deterministic action flow with
-  // the FRESHLY named hotel (`mentioned`) — never a stale
-  // session.propertyId. activeIntent (set below, at the point the action was
-  // first detected) is NOT touched here, so it keeps anchoring the flow
-  // through this hop too. ──
   if (currentSession.awaitingHotelForAction) {
     const lang = currentSession.lastKnownLanguage || "English";
 
@@ -3067,6 +3280,7 @@ async function handleWithProperties({
       return reply("text", { text });
     }
 
+    logEvent(sessionId, "route", { branch: "action_hotel_confirmed", property: mentioned.name });
     updateSession(sessionId, { awaitingHotelForAction: false });
     return await handleActionFlow({
       sessionId,
@@ -3076,8 +3290,8 @@ async function handleWithProperties({
     });
   }
 
-  // ── Step-by-step check-in / check-out / adults collection in progress. ──
   if (currentSession.searchDetailStep) {
+    logEvent(sessionId, "route", { branch: "search_detail_collection" });
     return await handleSearchDetailCollection({
       sessionId,
       message,
@@ -3086,8 +3300,8 @@ async function handleWithProperties({
     });
   }
 
-  // ── Guest-detail / booking-confirmation flow in progress. ──
   if (currentSession.guestDetailStep) {
+    logEvent(sessionId, "route", { branch: "guest_detail_collection" });
     return await handleGuestDetailCollection({
       sessionId,
       message,
@@ -3096,13 +3310,8 @@ async function handleWithProperties({
     });
   }
 
-  // ── Cancel / check-in / check-out / lookup verification flow in progress.
-  // This is the key latency fix: once this is set, every turn here is a
-  // direct executeTool call or a cheap UTILITY_MODEL classification — the
-  // big tool-calling model (continueWithModel/runConversation) is never
-  // called again for the rest of this action, exactly like guestDetailStep
-  // does for booking. ──
   if (currentSession.actionFlowStep) {
+    logEvent(sessionId, "route", { branch: "action_flow_continuation" });
     return await handleActionFlow({
       sessionId,
       message,
@@ -3111,7 +3320,6 @@ async function handleWithProperties({
     });
   }
 
-  // ── Offer selection check — runs before any RAG/intent work. ──
   const offerSelection = currentSession.lastOffers
     ? await resolveOfferSelection(message, currentSession.lastOffers)
     : null;
@@ -3133,6 +3341,7 @@ async function handleWithProperties({
   }
 
   if (offerSelection?.offer) {
+    logEvent(sessionId, "route", { branch: "offer_selected", offer: offerSelection.offer.name });
     const lang = currentSession.lastKnownLanguage || "English";
     return await enterGuestDetailFlow({
       sessionId,
@@ -3143,20 +3352,13 @@ async function handleWithProperties({
     });
   }
 
-  // ═══════════════════════════════════════════════════════════════════════
-  // Semantic action-intent classification — the SAME single utility-model
-  // call already used for language detection now also returns actionIntent,
-  // decided from MEANING (any language, any spelling, any phrasing) rather
-  // than keyword matching. regexHint is passed in purely as a same-turn,
-  // zero-latency-cost tie-breaker signal and a fallback if the model call
-  // fails — it never overrides a clear semantic read on its own.
-  // ═══════════════════════════════════════════════════════════════════════
   const regexHint = regexIntentHint(message);
 
   const analysis = await analyzeGuestMessage(
     message,
     currentSession.history,
     regexHint,
+    sessionId,
   );
   const { intent, actionIntent, language, englishQuery } = analysis;
 
@@ -3173,9 +3375,9 @@ async function handleWithProperties({
     { role: "user", content: message },
   ];
 
-  // ── Fresh booking request — always reconfirm which hotel, unless named in
-  // this same message. Never touches the big tool-calling model. ──
   if (intent === "ACTION_REQUEST" && actionIntent === "BOOK") {
+    logEvent(sessionId, "route", { branch: "book", mentioned: Boolean(mentioned) });
+
     if (!mentioned) {
       const text = await translateToLanguage(
         buildAskHotelText(properties, true),
@@ -3188,10 +3390,6 @@ async function handleWithProperties({
       return reply("text", { text });
     }
 
-    // Pre-fill from whatever the guest already gave in this same message,
-    // instead of always starting blank at "check-in date". Drop any
-    // extracted date pair that's invalid (past, or departure <= arrival) so
-    // it falls back to the normal ask-and-validate flow for that field.
     const extracted = extractQuickBookingDetails(message);
     if (extracted.arrival && isPastDate(extracted.arrival)) {
       delete extracted.arrival;
@@ -3238,12 +3436,6 @@ async function handleWithProperties({
       return reply("text", { text });
     }
 
-    // Arrival, departure, and adults were all already given — go straight to
-    // fetching offers instead of asking three questions the guest already
-    // answered. If the guest also gave full name + email + phone in the same
-    // message, piggyback on the existing "known guest" prefill mechanism
-    // (already used for returning guests) so the flow lands directly on the
-    // confirmation step instead of asking for each guest field again.
     if (extracted.fullName && extracted.email && extracted.phone) {
       updateSession(sessionId, {
         knownGuestDetails: {
@@ -3273,14 +3465,9 @@ async function handleWithProperties({
     });
   }
 
-  // ── Fresh "show me my reservation" request — deterministic once
-  // actionIntent === "LOOKUP" has been decided semantically above. Same
-  // fresh-hotel-gate + latency treatment as CANCEL/CHECK_IN/CHECK_OUT below:
-  // always requires the hotel to be named FRESH for this request — never
-  // reuses a sticky session.propertyId left over from an earlier, unrelated
-  // action in this conversation — and never touches the big tool-calling
-  // model. ──
   if (intent === "ACTION_REQUEST" && actionIntent === "LOOKUP") {
+    logEvent(sessionId, "route", { branch: "lookup", mentioned: Boolean(mentioned) });
+
     if (!mentioned) {
       const text = await translateToLanguage(
         buildAskHotelText(properties, false),
@@ -3301,21 +3488,14 @@ async function handleWithProperties({
     });
   }
 
-  // ── Fresh cancel / check-in / check-out request — same latency fix as
-  // booking above: resolve the hotel gate deterministically, then hand off
-  // straight into handleActionFlow. continueWithModel/runConversation (the
-  // big tool-calling model) is never invoked for these three intents at all.
-  // The hotel must be named FRESH in this message (`mentioned`) rather than
-  // falling back to a sticky session.propertyId — a guest who already
-  // checked into (or contacted) one hotel earlier in this conversation may
-  // now be contacting a DIFFERENT property, and silently reusing the old
-  // one would route the action to the wrong hotel. ──
   if (
     intent === "ACTION_REQUEST" &&
     (actionIntent === "CANCEL" ||
       actionIntent === "CHECK_IN" ||
       actionIntent === "CHECK_OUT")
   ) {
+    logEvent(sessionId, "route", { branch: actionIntent.toLowerCase(), mentioned: Boolean(mentioned) });
+
     if (!mentioned) {
       const text = await translateToLanguage(
         buildAskHotelText(properties, false),
@@ -3336,16 +3516,54 @@ async function handleWithProperties({
     });
   }
 
-  // ── An action completed (or the guest moved on) — clear the anchor once
-  // we're back to plain conversation/lookup territory so it doesn't stick
-  // around forever and block a genuinely new intent later. Only clears on
-  // NEW_QUESTION/SMALL_TALK, never mid-flow (FOLLOW_UP/ACTION_REQUEST keep it). ──
+  if (intent === "ACTION_REQUEST" && (!actionIntent || actionIntent === "NONE")) {
+    logEvent(sessionId, "route", { branch: "unsupported_action_request" });
+    updateSession(sessionId, { activeIntent: null, lastReservations: null });
+
+    if (PAYMENT_LINK_REGEX.test(message)) {
+      const text = await translateToLanguage(
+        PAYMENT_LINK_REFUSAL_SENTENCE,
+        language,
+      );
+      updateSession(sessionId, {
+        history: [...history, { role: "assistant", content: text }],
+      });
+      return reply("text", { text });
+    }
+
+    if (FEEDBACK_REGEX.test(message)) {
+      const text = await translateToLanguage(FEEDBACK_REFUSAL_SENTENCE, language);
+      updateSession(sessionId, {
+        history: [...history, { role: "assistant", content: text }],
+      });
+      return reply("text", { text });
+    }
+
+    // Not a recognized action and not one of the known unsupported
+    // requests either — let the normal LLM/RAG response handle it instead
+    // of forcing the hotel-verification flow.
+    return await continueWithModel({
+      sessionId,
+      chatbotId,
+      message,
+      properties,
+      chatbot,
+      session: sessions.get(sessionId),
+      effectiveProperty,
+      intent: "NEW_QUESTION",
+      language,
+      englishQuery,
+    });
+  }
+
   if (
     (intent === "NEW_QUESTION" || intent === "SMALL_TALK") &&
     (!actionIntent || actionIntent === "NONE")
   ) {
     updateSession(sessionId, { activeIntent: null, lastReservations: null });
   }
+
+  logEvent(sessionId, "route", { branch: "continue_with_model", intent });
 
   return await continueWithModel({
     sessionId,
@@ -3364,34 +3582,55 @@ async function handleWithProperties({
 // ─── Main service ──────────────────────────────────────────────────────────
 export const chatbotService = {
   async handleMessage({ sessionId, chatbotId, message }) {
-    const chatbot = await Chatbot.findByPk(chatbotId);
-    if (!chatbot) throw new NotFoundError("Chatbot not found.");
-
-    const session = getOrCreateSession(sessionId, chatbotId);
-    if (session.chatbotId !== chatbotId)
-      throw new AppError("Session does not belong to this chatbot.", 400);
-
-    const chatbotWithProps = await Chatbot.findByPk(chatbotId, {
-      include: [{ model: Property, through: { attributes: [] } }],
-    });
-    const properties = chatbotWithProps?.properties ?? [];
-
-    if (properties.length === 0) {
-      return handleDocumentOnlySession({
-        sessionId,
-        chatbotId,
-        message,
-        chatbot,
-      });
-    }
-
-    return handleWithProperties({
-      sessionId,
-      chatbotId,
+    const startedAt = Date.now();
+    logEvent(sessionId, "incoming_message", {
+      chatbotId: shortId(chatbotId),
       message,
-      properties,
-      chatbot,
     });
+
+    try {
+      const chatbot = await Chatbot.findByPk(chatbotId);
+      if (!chatbot) throw new NotFoundError("Chatbot not found.");
+
+      const session = getOrCreateSession(sessionId, chatbotId);
+      if (session.chatbotId !== chatbotId)
+        throw new AppError("Session does not belong to this chatbot.", 400);
+
+      const chatbotWithProps = await Chatbot.findByPk(chatbotId, {
+        include: [{ model: Property, through: { attributes: [] } }],
+      });
+      const properties = chatbotWithProps?.properties ?? [];
+
+      const result =
+        properties.length === 0
+          ? await handleDocumentOnlySession({
+              sessionId,
+              chatbotId,
+              message,
+              chatbot,
+            })
+          : await handleWithProperties({
+              sessionId,
+              chatbotId,
+              message,
+              properties,
+              chatbot,
+            });
+
+      logEvent(sessionId, "reply_sent", {
+        type: result?.type,
+        elapsedMs: Date.now() - startedAt,
+        text: result?.text,
+      });
+
+      return result;
+    } catch (err) {
+      logEvent(sessionId, "handle_message_failed", {
+        elapsedMs: Date.now() - startedAt,
+        error: err.message,
+      });
+      throw err;
+    }
   },
 
   async getProperties({ chatbotId }) {
@@ -3407,7 +3646,6 @@ export const chatbotService = {
     }));
   },
 
-  // ── Non-LLM path: modal form submit (unchanged). ──
   async searchOffers({
     sessionId,
     chatbotId,
