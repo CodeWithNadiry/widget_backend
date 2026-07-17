@@ -123,42 +123,46 @@ this — small talk is never a factual question, so the no-information rule neve
 `.trim();
 
 // ─── Action-request rule ────────────────────────────────────────────────────
+// NOTE: booking, and check-in/check-out/cancellation requests, never reach this
+// instruction in practice — booking is fully deterministic, and check-in/
+// check-out/cancellation no longer exist as features at all (the chatbot
+// refuses those by plain text before the model is ever invoked). This is kept
+// only as a defensive fallback in case a reservation-lookup ACTION_REQUEST
+// ever reaches the model directly.
 const ACTION_REQUEST_INSTRUCTION = `
-The guest is expressing intent to perform an action (check in/out, or cancel a reservation), not
-asking a factual question. (Note: booking a room is handled entirely by the app before this point
-— you will not see fresh booking requests here.)
+The guest is expressing intent to look up their reservation, not asking a factual question.
+(Note: booking a room, and check-in/check-out/cancellation requests, are handled entirely by the
+app before this point — you will not see those here.)
 
 - Do NOT refuse and do NOT say you don't have that information.
 - Follow the TOOL RULE section above: ask for whatever details are missing, or call the
   appropriate tool immediately if you already have everything you need.
-- The guest's ACTIVE INTENT for this conversation is stated above (e.g. CANCEL, CHECK_IN,
-  CHECK_OUT) — stay on that action. Do not drift into booking a new room or any other flow unless
-  the guest explicitly says they want something different.
+- The guest's ACTIVE INTENT for this conversation is stated above — stay on that action. Do not
+  drift into booking a new room or any other flow unless the guest explicitly says they want
+  something different.
 `.trim();
 
 // ─── Tool usage rule ───────────────────────────────────────────────────────
 const TOOL_RULE = `
 TOOL RULE:
-- Always use tools for actions (lookup, check-in, check-out, cancellation). Never simulate or guess results.
+- Always use tools for reservation lookups. Never simulate or guess results.
 - Never ask the guest to repeat information you already have.
 - You do NOT have a getOffers or createBooking tool call available to you for fresh bookings —
   the app handles the entire booking flow (hotel, dates, adults, offer selection, guest details,
   confirmation) outside of you. If the guest asks to book a room, you will not normally see that
   message at all; if you ever do, just say booking is handled right here in chat and let the app take it.
 
-SEQUENTIAL TOOL RULES — never call these in the same turn:
-1. getReservation → checkIn / checkOut: Before calling checkIn or checkOut, resolve the guest's
-   reservationId first via getReservation.
-   - Ask for ONLY ONE verification method at a time — the last 4 digits of their phone number,
-     by default. Do NOT list both options ("last 4 digits of your phone number or your room
-     number and date of birth") in the same message — that reads like a form, not a conversation.
-   - Only if the guest says they don't have, don't know, or can't find that (e.g. "I forgot",
-     "I don't have my phone"), switch to asking for the alternative (room number + date of birth)
-     in one short, friendly sentence — never re-offer the first method again once they've said
-     they can't provide it.
-   - Never ask the guest for a "reservation ID" by name — once getReservation returns, confirm
-     the booking back to the guest in plain terms, then call checkIn/checkOut with the resolved id.
-2. One tool call per turn maximum when the second call depends on the first call's output.
+RESERVATION LOOKUP RULE:
+- Ask for ONLY ONE verification method at a time — the last 4 digits of their phone number,
+  by default. Do NOT list both options ("last 4 digits of your phone number or your room
+  number and date of birth") in the same message — that reads like a form, not a conversation.
+- Only if the guest says they don't have, don't know, or can't find that (e.g. "I forgot",
+  "I don't have my phone"), switch to asking for the alternative (room number + date of birth)
+  in one short, friendly sentence — never re-offer the first method again once they've said
+  they can't provide it.
+- Never ask the guest for a "reservation ID" by name — once getReservation returns, confirm
+  the booking back to the guest in plain terms.
+- One tool call per turn maximum when a second call would depend on the first call's output.
 
 MULTIPLE RESERVATIONS RETURNED:
 - If getReservation returns more than one matching reservation, list them briefly (name/dates/status)
@@ -168,11 +172,10 @@ MULTIPLE RESERVATIONS RETURNED:
   Never say "I don't understand" to a reference like that — trust the resolved id you're given.
 
 HOTEL-SPECIFIC TOOL GATE:
-- If the guest wants to use ANY hotel-specific tool (getReservation, checkIn, checkOut,
-  cancelReservation) and no hotel is confirmed yet for this conversation, you MUST NOT collect any
-  other information first (name, phone, reservation details, etc.) — asking which hotel is the
-  ONLY thing you do in that turn. Ask which hotel first, in one short sentence, and WAIT for the
-  reply before asking anything else.
+- If the guest wants to use the getReservation tool and no hotel is confirmed yet for this
+  conversation, you MUST NOT collect any other information first (name, phone, reservation
+  details, etc.) — asking which hotel is the ONLY thing you do in that turn. Ask which hotel
+  first, in one short sentence, and WAIT for the reply before asking anything else.
 - Once a hotel IS confirmed for this conversation, NEVER ask which hotel again for this same kind
   of action — continue straight on with resolving the guest's reservation.
 - Never combine "which hotel?" with any other question in the same message, even if the guest's
@@ -274,7 +277,7 @@ const INVALID_EMAIL_SENTENCE =
 const INVALID_PHONE_SENTENCE =
   "That doesn't look like a valid phone number. Please include your country code and try again.";
 const BOOKING_CANCELLED_SENTENCE =
-  "No problem. Please let me know if your reservation details are incorrect, if you'd like to choose a different room, or if you'd like to cancel this booking.";
+  "No problem. Could you please tell me which reservation details you'd like to change?";
 const BOOKING_CANCELLED_FINAL_SENTENCE =
   "No problem, this booking request has been cancelled. Let me know if you'd like to start a new one.";
 const PAYMENT_LINK_REFUSAL_SENTENCE =
@@ -297,16 +300,25 @@ const ASK_ADULTS_SENTENCE = "How many adults will be staying?";
 const INVALID_DATE_SENTENCE =
   "I couldn't understand that date. Could you try again?";
 const PAST_DATE_SENTENCE =
-  "That date has already passed. Please give a check-in date of today or later.";
+  "Please enter valid check-in and check-out dates. The selected dates are in the past.";
 const INVALID_DEPARTURE_SENTENCE =
   "Check-out must be after check-in. Could you give a valid date?";
-const INVALID_ADULTS_SENTENCE = "Please enter a number between 1 and 10.";
+// Part 4 — guest count validation, three distinct failure cases.
+const INVALID_ADULTS_SENTENCE =
+  "Please tell me how many adults will be staying (between 1 and 5).";
+const INVALID_ADULTS_WHOLE_NUMBER_SENTENCE =
+  "Please enter a valid whole number of guests.";
+const INVALID_ADULTS_MIN_SENTENCE = "Please enter at least 1 guest.";
+const INVALID_ADULTS_MAX_SENTENCE =
+  "Please enter 5 guests or fewer. Our offers only support up to 5 guests.";
 const NO_ROOMS_SENTENCE =
   "No rooms are available for those dates. Want to try different ones?";
 const OFFERS_INTRO_SENTENCE =
   "Here are the available offers. Reply with a number to choose your room.";
 
 // ─── Fixed sentences for the deterministic action-verification flow ───────
+// (Only used for the LOOKUP intent now — check-in/check-out/cancellation
+// have been removed entirely, see UNSUPPORTED_FEATURE_SENTENCES below.)
 const ASK_PHONE_VERIFY_SENTENCE =
   "What are the last 4 digits of the phone number on the booking?";
 const INVALID_PHONE_VERIFY_SENTENCE =
@@ -321,12 +333,6 @@ const INVALID_ALT_VERIFY_NO_NAME_SENTENCE =
   "I couldn't quite catch that. What's your room number, and your date of birth?";
 const RESERVATION_NOT_FOUND_SENTENCE =
   "I couldn't find a booking with those details. Could you double check and try again?";
-const ACTION_ABORTED_SENTENCE =
-  "No problem. Let me know if there's anything else.";
-const ACTION_FAILED_SENTENCE =
-  "That couldn't be completed right now. Please contact the front desk directly.";
-const UNCLEAR_ACTION_CONFIRMATION_SENTENCE =
-  "Please reply yes to go ahead, or no to cancel.";
 
 // Guest asked for something this assistant has no tool for at all (payment
 // links, emailing/WhatsApp-ing a receipt/invoice/confirmation/key/passcode,
@@ -334,44 +340,27 @@ const UNCLEAR_ACTION_CONFIRMATION_SENTENCE =
 const UNSUPPORTED_ACTION_SENTENCE =
   "Sorry, I can't send that through this chat. Please contact the hotel directly for that.";
 
-// Fallback used if the action-verification flow is ever entered for an
-// intent it doesn't actually know how to handle (defensive backstop).
-const ACTION_UNRECOGNIZED_SENTENCE =
-  "I'm not able to help with that request here. Please contact the hotel directly, or let me know if there's something else I can do.";
+// Part 1 & 2 — check-in, check-out, and cancellation have been removed
+// entirely as features. These fixed sentences are used to recognize the
+// guest's intent and respond in plain text — no tool is ever called for them.
+const CHECKIN_UNSUPPORTED_SENTENCE =
+  "Sorry, I can't help with online check-in through this chat.";
+const CHECKOUT_UNSUPPORTED_SENTENCE =
+  "Sorry, I can't help with online check-out through this chat.";
+const CANCEL_UNSUPPORTED_SENTENCE =
+  "Sorry, I can't cancel reservations through this chat.";
+const EMAIL_UNSUPPORTED_SENTENCE =
+  "Sorry, I can't send emails from this chat.";
+
+const UNSUPPORTED_FEATURE_SENTENCES = {
+  CANCEL_UNSUPPORTED: CANCEL_UNSUPPORTED_SENTENCE,
+  CHECKIN_UNSUPPORTED: CHECKIN_UNSUPPORTED_SENTENCE,
+  CHECKOUT_UNSUPPORTED: CHECKOUT_UNSUPPORTED_SENTENCE,
+};
 
 // ─── Fixed sentence for an LLM/tool failure mid-conversation ──────────────
 const LLM_FAILURE_SENTENCE =
   "I'm having trouble processing that right now. Could you try again in a moment?";
-
-const ACTION_SUCCESS_SENTENCES = {
-  CANCEL: "Your reservation has been cancelled.",
-  CHECK_IN: "You're checked in. Enjoy your stay!",
-  CHECK_OUT: "You're checked out. Thank you for staying with us!",
-};
-
-const ACTION_TOOL_NAME = {
-  CANCEL: "cancelReservation",
-  CHECK_IN: "checkIn",
-  CHECK_OUT: "checkOut",
-};
-
-const ACTION_VERB = {
-  CANCEL: "cancel",
-  CHECK_IN: "check in",
-  CHECK_OUT: "check out",
-};
-
-function buildActionConfirmText(activeIntent, reservation) {
-  const verb = ACTION_VERB[activeIntent] || "proceed with";
-  const name = reservation.guestName
-    ? ` under **${reservation.guestName}**`
-    : "";
-  const dates =
-    reservation.arrival && reservation.departure
-      ? ` (**${reservation.arrival}** to **${reservation.departure}**)`
-      : "";
-  return `Found your booking${name}${dates}. Shall I ${verb} now?`;
-}
 
 function buildReservationListText(reservations) {
   const lines = reservations.map(
@@ -410,20 +399,11 @@ function looksLikeGuestReadableMessage(text) {
   return true;
 }
 
-const UNSUPPORTED_CHANNEL_REGEX =
-  /\b(whatsapp|email|e-?mail|sms|text message)\b/i;
-
-function sanitizePmsMessage(text) {
-  if (!looksLikeGuestReadableMessage(text)) return null;
-  if (!UNSUPPORTED_CHANNEL_REGEX.test(text)) return text;
-
-  const sentences = text.split(/(?<=[.!?])\s+/);
-  const kept = sentences.filter((s) => !UNSUPPORTED_CHANNEL_REGEX.test(s));
-
-  if (kept.length === 0) {
-    return "This needs to be resolved at the front desk before check-in. Please contact them directly.";
-  }
-  return `${kept.join(" ")} Please contact the front desk directly for that.`.trim();
+// ─── Fixed sentence to acknowledge the guest's offer selection before ─────
+// ─── moving into guest-detail collection (Part 5). ─────────────────────────
+function buildOfferAcknowledgmentText(offerName) {
+  const label = offerName ? `the **${offerName}**` : "your selected room";
+  return `Great! You selected ${label}. Let's complete your booking.`;
 }
 
 function buildConfirmationText({ fullName, email, phone }) {
@@ -457,28 +437,21 @@ HOTEL SCOPE RULE:
 - Only ask which hotel BEFORE answering when the guest is trying to use a hotel-specific tool
   (see TOOL RULE), and no hotel is confirmed yet. Never ask which hotel for a plain informational question.
 - NOTE: this "stay locked onto the confirmed hotel" behavior applies ONLY to plain informational
-  Q&A. It does NOT apply to starting a new booking, cancellation, check-in, check-out, or
-  reservation lookup — those always reconfirm the hotel fresh (see ACTION HOTEL RULE below).
+  Q&A. It does NOT apply to starting a new booking or reservation lookup — those always reconfirm
+  the hotel fresh (see ACTION HOTEL RULE below).
 `.trim();
 
 const ACTION_HOTEL_RULE = `
 ACTION HOTEL RULE:
-- Every time the guest starts a NEW booking, cancellation, check-in, check-out, or reservation
-  lookup, the hotel must be confirmed FRESH for that specific request — never silently reuse a
-  hotel that was only confirmed for an earlier, different action or question in this same
-  conversation. A guest who already checked into one property earlier may now be contacting a
-  completely different one.
+- Every time the guest starts a NEW booking or reservation lookup, the hotel must be confirmed
+  FRESH for that specific request — never silently reuse a hotel that was only confirmed for an
+  earlier, different action or question in this same conversation. A guest who already looked up
+  a reservation at one property earlier may now be contacting a completely different one.
 - This is handled deterministically before you are ever invoked for these flows — you will simply
   see the hotel already resolved by the time you're asked to act.
 `.trim();
 
-const PROPERTY_SCOPED_TOOLS = new Set([
-  "getOffers",
-  "getReservation",
-  "checkIn",
-  "checkOut",
-  "cancelReservation",
-]);
+const PROPERTY_SCOPED_TOOLS = new Set(["getOffers", "getReservation"]);
 
 const CANCEL_INTENT_REGEX = /\b(cancel|cancelling|cancellation)\b/i;
 const CHECKIN_INTENT_REGEX = /\b(check[\s-]?in|checking in)\b/i;
@@ -491,9 +464,9 @@ const BOOK_INTENT_REGEX = /\b(book|reserve|reservation|booking)\b/i;
 
 function regexIntentHint(text) {
   const t = text || "";
-  if (CANCEL_INTENT_REGEX.test(t)) return "CANCEL";
-  if (CHECKIN_INTENT_REGEX.test(t)) return "CHECK_IN";
-  if (CHECKOUT_INTENT_REGEX.test(t)) return "CHECK_OUT";
+  if (CANCEL_INTENT_REGEX.test(t)) return "CANCEL_UNSUPPORTED";
+  if (CHECKIN_INTENT_REGEX.test(t)) return "CHECKIN_UNSUPPORTED";
+  if (CHECKOUT_INTENT_REGEX.test(t)) return "CHECKOUT_UNSUPPORTED";
   if (LOOKUP_INTENT_REGEX.test(t)) return "LOOKUP";
   if (RESERVATION_NOUN_REGEX.test(t) && !BOOK_VERB_REGEX.test(t))
     return "LOOKUP";
@@ -502,18 +475,15 @@ function regexIntentHint(text) {
 }
 
 const VALID_ACTION_INTENTS = new Set([
-  "CANCEL",
-  "CHECK_IN",
-  "CHECK_OUT",
+  "CANCEL_UNSUPPORTED",
+  "CHECKIN_UNSUPPORTED",
+  "CHECKOUT_UNSUPPORTED",
   "LOOKUP",
   "BOOK",
   "NONE",
 ]);
 
 const INTENT_LABELS = {
-  CANCEL: "The guest wants to CANCEL a reservation.",
-  CHECK_IN: "The guest wants to CHECK IN.",
-  CHECK_OUT: "The guest wants to CHECK OUT.",
   BOOK: "The guest wants to book a new room.",
   LOOKUP:
     "The guest wants to see their existing reservation DETAILS/STATUS/ID — this is a read-only lookup, nothing gets modified.",
@@ -541,19 +511,83 @@ const CHEAPEST_REGEX = /cheap/i;
 // they want next WITHOUT involving the LLM, per the "deterministic flow"
 // requirement (Problem 10). ─────────────────────────────────────────────
 const WANTS_ANOTHER_ROOM_REGEX =
-  /\b(another room|different room|other room|change (the )?room|pick another|choose another|different offer|another offer|other offer|new room)\b/i;
+  /\b(another rooms?|different rooms?|other rooms?|change (the )?rooms?|pick another|choose another|different offers?|another offers?|other offers?|new rooms?)\b/i;
 const WANTS_CANCEL_BOOKING_REGEX =
   /\b(cancel (this|the|my)?\s*(booking|reservation)?|nevermind|never mind|forget it|don'?t want (it|this)|stop the booking|no longer want)\b/i;
 const MENTIONS_NAME_FIELD_REGEX = /\bname\b/i;
 const MENTIONS_EMAIL_FIELD_REGEX = /\bemail\b/i;
-const MENTIONS_PHONE_FIELD_REGEX = /\bphone|number\b/i;
+const MENTIONS_PHONE_FIELD_REGEX = /\b(phone|number)\b/i;
+
+// Part 7 Case 5 — "everything is wrong" / "all my details are incorrect" /
+// "my reservation data is wrong" — restart full personal-info collection.
+const ALL_DETAILS_WRONG_REGEX =
+  /\b(everything|all)\b[\s\S]{0,40}\b(wrong|incorrect)\b|\b(reservation|personal|guest)?\s*(data|details|information)\b[\s\S]{0,25}\b(wrong|incorrect)\b/i;
+
+// Part 8 — correction cancellation ("Sorry, my email is actually correct.")
+// while a specific field correction is being asked for. Broadened so it
+// also catches "<subject> is/are correct" phrasing (e.g. "my email and
+// phone number is correct"), not just the narrower "it's correct" form —
+// the narrower version alone was missing common real-world replies.
+const CORRECTION_KEEP_REGEX =
+  /\b(actually|nevermind|never mind|no need|leave it|keep (it|the (old|previous|existing))|don'?t need to change)\b|\b(is|are|it'?s|that'?s|they'?re|those are)\s*(actually\s+|already\s+)?(correct|fine|right|ok(ay)?|unchanged|the same)\b/i;
+
+// ─── Global mid-flow intent overrides (Problem 1, 7, 8, 9, 14) ────────────
+// These are checked BEFORE treating a message as a raw field value (name,
+// email, phone, date, guest count) anywhere in the booking/search flows.
+// Kept as cheap regex checks (no extra LLM round-trip) since the phrasing
+// patterns in the spec are distinctive enough to match deterministically.
+//
+// ANOTHER_BOOKING_REGEX is intentionally verb-scoped (requires "book",
+// "reserve", or "start ... new" attached to the noun) so that a bare
+// "another room" / "choose another room" — which the spec's OFFER CHANGES
+// section treats as switching the CURRENT booking's room, not abandoning
+// it — is not misrouted into a full restart. A literal new-booking request
+// always contains one of these verbs ("book another room", "start over",
+// "book again", "reserve another").
+const CHANGE_OFFER_MIDFLOW_REGEX =
+  /\b(change (the |this |my )?(offer|room selection)|different offers?|another offers?|other offers?|another rooms?|other rooms?|pick (a )?different (room|offer)|pick another (room|offer)|choose (a )?different (room|offer)|choose another (room|offer)|switch (the )?offer|return to (the )?offer selection|offer selection|show (available )?offers( again)?|available offers)\b/i;
+const ANOTHER_BOOKING_REGEX =
+  /\b(book another|book again|reserve another|book (a )?new (room|reservation)|start (a )?new (reservation|booking)|new (reservation|booking)|one more room|second (room|reservation|booking)|start over)\b/i;
+const SHOW_RESERVATION_MIDFLOW_REGEX =
+  /\b(show|see|check|view|find|look up)\b.{0,20}\b(my )?(reservation|booking)\b|\bmy (reservation|booking)\b/i;
+
+// Returns one of "CHANGE_OFFER", "ANOTHER_BOOKING", "LOOKUP",
+// "CANCEL_UNSUPPORTED", "CHECKIN_UNSUPPORTED", "CHECKOUT_UNSUPPORTED", or
+// null (meaning: no override detected, treat the message as the field
+// value / date / count currently being collected).
+//
+// ANOTHER_BOOKING is checked FIRST: it's verb-scoped (see above), so it
+// only fires on an explicit "book/reserve/start-new" phrase and never
+// overlaps with the broader CHANGE_OFFER patterns below. This lets
+// "book another room" route to a fresh booking while "choose another
+// room" / "show other rooms" correctly route to CHANGE_OFFER.
+function checkFieldOverrideIntent(message, { includeChangeOffer = true } = {}) {
+  if (ANOTHER_BOOKING_REGEX.test(message)) return "ANOTHER_BOOKING";
+  if (includeChangeOffer && CHANGE_OFFER_MIDFLOW_REGEX.test(message))
+    return "CHANGE_OFFER";
+  if (
+    SHOW_RESERVATION_MIDFLOW_REGEX.test(message) &&
+    !BOOK_VERB_REGEX.test(message)
+  )
+    return "LOOKUP";
+  if (CANCEL_INTENT_REGEX.test(message)) return "CANCEL_UNSUPPORTED";
+  if (CHECKIN_INTENT_REGEX.test(message)) return "CHECKIN_UNSUPPORTED";
+  if (CHECKOUT_INTENT_REGEX.test(message)) return "CHECKOUT_UNSUPPORTED";
+  return null;
+}
 
 // Unsupported action requests (Problems 6-8): things the assistant has no
 // tool for at all. Detected deterministically so they never trigger the
 // hotel-verification gate.
 const PAYMENT_LINK_REGEX =
   /\b(payment link|pay link|link to pay|send.*(pay|invoice)|invoice link)\b/i;
-const FEEDBACK_REGEX = /\b(feedback|complaint|review|suggestion box)\b/i;
+const FEEDBACK_REGEX =
+  /\b(feedback|complaint|review|suggestion box)\b/i;
+// Part 2 — "Send me a confirmation email" and similar resend-by-email
+// requests. There is no email-sending tool at all, so this is answered
+// deterministically, the same way payment-link/feedback requests are.
+const EMAIL_RESEND_REGEX =
+  /\b(send|resend|re-send|email me|mail me)\b[\s\S]{0,30}\b(email|confirmation|receipt|invoice|form)\b|\b(confirmation|receipt) email\b/i;
 
 const FIELD_TO_STEP = { fullName: "name", email: "email", phone: "phone" };
 
@@ -562,6 +596,28 @@ function getCorrectionAskSentence(field) {
   if (field === "email") return ASK_CORRECTION_EMAIL_SENTENCE;
   if (field === "phone") return ASK_CORRECTION_PHONE_SENTENCE;
   return ASK_NAME_SENTENCE;
+}
+
+// Returns the correct "please provide this field" prompt for a guest-detail
+// collection step, respecting whether we're currently in a correction flow.
+function askSentenceForGuestStep(step, correctingField) {
+  if (step === "name")
+    return correctingField ? ASK_CORRECTION_NAME_SENTENCE : ASK_NAME_SENTENCE;
+  if (step === "email")
+    return correctingField
+      ? ASK_CORRECTION_EMAIL_SENTENCE
+      : ASK_EMAIL_SENTENCE;
+  if (step === "phone")
+    return correctingField
+      ? ASK_CORRECTION_PHONE_SENTENCE
+      : ASK_PHONE_SENTENCE;
+  return ASK_NAME_SENTENCE;
+}
+
+function askSentenceForSearchStep(step) {
+  if (step === "departure") return ASK_DEPARTURE_SENTENCE;
+  if (step === "adults") return ASK_ADULTS_SENTENCE;
+  return ASK_ARRIVAL_SENTENCE;
 }
 
 const HOTEL_NAME_STOP_WORDS = new Set([
@@ -770,6 +826,73 @@ function tryParseDateFast(input, referenceDate = new Date()) {
   return null;
 }
 
+// ─── Guest-count understanding: digits, number words ("one", "TWO"), and
+// natural sentences ("we are two", "there will be three adults"). Mirrors
+// the fast-regex-then-LLM-fallback pattern used by parseDateSmart above. ──
+const ADULTS_NUMBER_WORDS = {
+  one: 1,
+  two: 2,
+  three: 3,
+  four: 4,
+  five: 5,
+  six: 6,
+  seven: 7,
+  eight: 8,
+  nine: 9,
+  ten: 10,
+};
+
+// Returns { decimal: true } for non-whole numeric input (e.g. "1.5"),
+// { value: n } if a whole number or number word was found, or null if
+// nothing was understood by the fast path (caller should fall back to the
+// LLM).
+function extractAdultsFast(message) {
+  const trimmed = (message || "").trim();
+  if (/-?\d+\.\d+/.test(trimmed)) return { decimal: true };
+
+  const digitMatch = trimmed.match(/-?\d+/);
+  if (digitMatch) return { value: parseInt(digitMatch[0], 10) };
+
+  const lower = trimmed.toLowerCase();
+  for (const [word, num] of Object.entries(ADULTS_NUMBER_WORDS)) {
+    if (new RegExp(`\\b${word}\\b`).test(lower)) return { value: num };
+  }
+
+  return null;
+}
+
+// Full guest-count resolution: fast path first, then an LLM fallback for
+// anything phrased in a way the fast path can't catch (other languages,
+// unusual phrasing, etc.). Returns { decimal: true }, { value: n }, or null.
+async function parseAdultsSmart(input) {
+  const fast = extractAdultsFast(input);
+  if (fast) return fast;
+
+  try {
+    const res = await chatWithTools({
+      systemPrompt: `
+Convert the guest's reply about how many adults are staying into a single whole number.
+
+The guest may write a digit ("3"), a number word in any capitalization ("one", "Two", "THREE"),
+or a natural sentence containing a count ("we are two", "there will be three adults",
+"2 adults", "One guest", "4 guests").
+
+Reply with ONLY the integer as plain digits (e.g. "3"), nothing else — no words, no punctuation.
+If the message does not contain any understandable guest count at all, reply with exactly "NONE".
+`.trim(),
+      history: [{ role: "user", content: input }],
+      tools: [],
+      model: UTILITY_MODEL,
+    });
+    const text = (res.text || "").trim();
+    if (/^\d+$/.test(text)) return { value: parseInt(text, 10) };
+    return null;
+  } catch (err) {
+    logEvent(null, "parse_adults_smart_failed", { error: err.message });
+    return null;
+  }
+}
+
 async function parseDateSmart(input) {
   const fast = tryParseDateFast(input);
   if (fast) return fast;
@@ -800,6 +923,24 @@ const ADULTS_EXTRACT_REGEX =
 // catches the common typo'd form without loosening the other alternatives.
 const NAME_EXTRACT_REGEX =
   /\b(?:my (?:full )?name is|name[:\s]*is|i'?m|this is)\s+([a-zA-Z][a-zA-Z'\-]*(?:\s+[a-zA-Z][a-zA-Z'\-]*){0,3})/i;
+
+// Fixed (Part 7): NAME_EXTRACT_REGEX matches "my full name is <word>" for ANY
+// following word — so "My full name is incorrect." was being parsed as a
+// correction to the literal name "Incorrect". These are the words that
+// mean the guest is describing the field as wrong, not supplying a new
+// value, so a match starting with one of these is discarded.
+const NAME_FIELD_STOPWORDS = new Set([
+  "wrong",
+  "incorrect",
+  "correct",
+  "fine",
+  "right",
+  "actually",
+  "false",
+  "not",
+  "invalid",
+  "mistaken",
+]);
 
 function extractDateRangeFast(message, referenceDate = new Date()) {
   const trimmed = message.toLowerCase();
@@ -840,7 +981,8 @@ function extractQuickBookingDetails(message, referenceDate = new Date()) {
   const adultsMatch = message.match(ADULTS_EXTRACT_REGEX);
   if (adultsMatch) {
     const n = parseInt(adultsMatch[1], 10);
-    if (n >= 1 && n <= 10) details.adults = n;
+    // Part 4 — offers only support up to 5 guests (was 10).
+    if (n >= 1 && n <= 5) details.adults = n;
   } else if (/\bone adult\b/i.test(message)) {
     details.adults = 1;
   }
@@ -885,7 +1027,13 @@ function extractCorrectionFields(message) {
   const nameMatch = message.match(NAME_EXTRACT_REGEX);
   if (nameMatch) {
     const fullName = nameMatch[1].trim();
-    if (fullName.length >= 2) result.fullName = fullName;
+    const firstWord = fullName.split(/\s+/)[0].toLowerCase();
+    // Fixed (Part 7): discard matches like "My full name is incorrect" where
+    // the "name" captured is actually a description of the problem, not a
+    // real new name — see NAME_FIELD_STOPWORDS above.
+    if (fullName.length >= 2 && !NAME_FIELD_STOPWORDS.has(firstWord)) {
+      result.fullName = fullName;
+    }
   }
 
   return result;
@@ -936,7 +1084,6 @@ function getOrCreateSession(sessionId, chatbotId) {
       lastReservations: null,
       actionFlowStep: null,
       pendingVerification: null,
-      resolvedActionReservation: null,
       knownVerification: null,
       createdAt: Date.now(),
     });
@@ -985,10 +1132,10 @@ these four fields:
 {"intent": "...", "actionIntent": "...", "language": "...", "englishQuery": "..."}
 
 "intent" — one of:
-- "SMALL_TALK": casual conversational messages with no factual content — greetings, "how are
-  you", "what's up", pleasantries, thanks, goodbyes — in ANY language.
-- "ACTION_REQUEST": the guest wants to perform an action — book/reserve a room, check in/out,
-  cancel a reservation, or look up their existing reservation — EVEN IF no details (dates, name,
+- "SMALL_TALK": casual conversational messages with no factual content — greetings, "how are you",
+  "what's up", pleasantries, thanks, goodbyes — in ANY language.
+- "ACTION_REQUEST": the guest wants to perform an action — book/reserve a room, look up an
+  existing reservation, check in/out, or cancel a reservation — EVEN IF no details (dates, name,
   etc.) have been given yet, and even if the exact words used don't match any fixed keyword. This
   is NOT a factual question and never needs document grounding.
 - "FOLLOW_UP": the message directly answers, confirms, or continues what the assistant just
@@ -998,14 +1145,18 @@ these four fields:
 
 IMPORTANT: if the guest's message is a short, direct answer to a question you can see in the
 recent conversation history (like a bare phone-number fragment, a date, a name, or a yes/no),
-classify it as "FOLLOW_UP" — NOT "ACTION_REQUEST" — even if the conversation is about booking,
-check-in, or another action. Only use "ACTION_REQUEST" when the guest is newly expressing that
-they want to perform an action.
+classify it as "FOLLOW_UP" — NOT "ACTION_REQUEST" — even if the conversation is about booking or
+another action. Only use "ACTION_REQUEST" when the guest is newly expressing that they want to
+perform an action.
 
 "actionIntent" — ONLY meaningful when "intent" is "ACTION_REQUEST" (set to "NONE" otherwise). One of:
-- "CANCEL": the guest wants to cancel an existing reservation.
-- "CHECK_IN": the guest wants to check in.
-- "CHECK_OUT": the guest wants to check out.
+- "CANCEL_UNSUPPORTED": the guest wants to cancel an existing reservation. This hotel's chat
+  cannot cancel reservations at all — classify it as this so the assistant can give a plain,
+  polite refusal. No tool exists for this.
+- "CHECKIN_UNSUPPORTED": the guest wants to check in online (e.g. "I want to check in", "check
+  me in"). This chat cannot perform online check-in. No tool exists for this.
+- "CHECKOUT_UNSUPPORTED": the guest wants to check out online (e.g. "check me out"). This chat
+  cannot perform online check-out. No tool exists for this.
 - "LOOKUP": the guest wants to see or hear about their EXISTING reservation — its details,
   status, dates, id, or just "my reservation" / "my booking" in a general way — a read-only
   request, nothing gets created or modified. This is the correct choice whenever the guest is
@@ -1016,8 +1167,8 @@ they want to perform an action.
 - "BOOK": the guest wants to make a brand NEW reservation that does not exist yet (e.g. "I want
   to book a room", "can I reserve for next weekend").
 - "NONE": intent is not "ACTION_REQUEST", or the action doesn't fit any of the above (e.g. the
-  guest wants to send feedback, get a payment link, or something else this assistant has no tool
-  for).
+  guest wants to send feedback, get a payment link, have a confirmation emailed, or something
+  else this assistant has no tool for).
 ${
   regexHint && regexHint !== "NONE"
     ? `\nHINT (a cheap keyword scan detected a pattern matching ${regexHint} — this is only a weak same-turn signal, not a rule; use it as a tie-breaker ONLY if the message's actual meaning is genuinely ambiguous between two options, and ignore it entirely if the meaning clearly points elsewhere).`
@@ -1273,42 +1424,11 @@ the message is not referring to any of these reservations. No punctuation, no ex
 }
 
 // ═════════════════════════════════════════════════════════════════════════
-// Action-flow verification parsing
+// Action-flow verification parsing (used for the LOOKUP intent only — see
+// note on handleActionFlow below)
 // ═════════════════════════════════════════════════════════════════════════
 const NO_PHONE_REGEX =
   /\b(don'?t have|forgot|don'?t know|can'?t find|no phone|lost my phone|not with me)\b/i;
-
-// Loose (left-boundary only) mention detectors — used ONLY to catch the
-// guest explicitly naming a DIFFERENT action while a confirmation for
-// another action is still pending (see confirmAction below). Deliberately
-// more tolerant than CANCEL_INTENT_REGEX/CHECKIN_INTENT_REGEX/etc. so a
-// typo like "cancely" still registers as "cancel".
-function detectExplicitActionSwitch(message, currentActiveIntent) {
-  const t = message || "";
-  if (/\bcancel/i.test(t) && currentActiveIntent !== "CANCEL") return "CANCEL";
-  if (/\bcheck[\s-]?out/i.test(t) && currentActiveIntent !== "CHECK_OUT")
-    return "CHECK_OUT";
-  if (/\bcheck[\s-]?in/i.test(t) && currentActiveIntent !== "CHECK_IN")
-    return "CHECK_IN";
-  return null;
-}
-
-// ─── Mid-confirmation intent switch detector (final fix) ───────────────────
-// While the guest is being asked "Shall I check out / cancel / check in
-// now?", they may actually be typing a DIFFERENT action instead of
-// answering yes/no (e.g. "ok cancely my reservation" while a check-out
-// confirmation is pending). The word-boundary regexes used elsewhere
-// (CANCEL_INTENT_REGEX etc.) require an exact word match and miss common
-// typos like "cancely", so this uses loose substring matching instead —
-// deliberately narrower in scope (only used here, only to catch a genuine
-// intent switch) so it doesn't affect other classification paths.
-function detectCompetingActionIntent(message, currentIntent) {
-  const m = (message || "").toLowerCase();
-  if (currentIntent !== "CANCEL" && /cancel/.test(m)) return "CANCEL";
-  if (currentIntent !== "CHECK_OUT" && /check[\s-]?out/.test(m)) return "CHECK_OUT";
-  if (currentIntent !== "CHECK_IN" && /check[\s-]?in/.test(m)) return "CHECK_IN";
-  return null;
-}
 
 function extractPhoneLast4(message) {
   const digits = (message || "").replace(/[^\d]/g, "");
@@ -1418,59 +1538,21 @@ function buildAltVerificationInput({ lastName, roomNumber, dateOfBirth }) {
   return { lastName, roomNumber, dateOfBirth };
 }
 
-const YES_WORDS_REGEX =
-  /\b(yes|yeah|yep|yup|sure|ok(ay)?|go ahead|confirm(ed)?|correct|right|do it|please do|s[ií]|ja|oui|evet|haan|da|tak|si|ha)\b/i;
-const NO_WORDS_REGEX =
-  /\b(no|nope|nah|don'?t|stop|cancel that|not now|nein|non|hay[ıi]r|nahi|ne)\b/i;
-
-function fastYesNo(message) {
-  const trimmed = (message || "").trim().toLowerCase();
-  if (!trimmed) return null;
-  const isNo = NO_WORDS_REGEX.test(trimmed);
-  const isYes = YES_WORDS_REGEX.test(trimmed);
-  if (isNo && !isYes) return "NO";
-  if (isYes && !isNo) return "YES";
-  return null;
-}
-
-async function classifyYesNoLLM(message, contextQuestion) {
-  try {
-    const res = await chatWithTools({
-      systemPrompt: `
-The guest was just asked: "${contextQuestion}"
-Read their reply below, in ANY language, and classify it as EXACTLY ONE of: YES, NO, UNCLEAR.
-Reply with ONLY the single label, nothing else.
-`.trim(),
-      history: [{ role: "user", content: message }],
-      tools: [],
-      model: UTILITY_MODEL,
-    });
-    const label = (res.text || "").trim().toUpperCase();
-    return ["YES", "NO"].includes(label) ? label : "UNCLEAR";
-  } catch (err) {
-    logEvent(null, "yes_no_classify_failed", { error: err.message });
-    return "UNCLEAR";
-  }
-}
-
-async function classifyYesNo(message, contextQuestion) {
-  const fast = fastYesNo(message);
-  if (fast) return fast;
-  return await classifyYesNoLLM(message, contextQuestion);
-}
-
 async function classifyConfirmationReply(message) {
   try {
     const res = await chatWithTools({
       systemPrompt: `
 The guest was just shown their reservation details and asked "Shall I proceed with this booking?"
 Read their reply below, in ANY language, and classify it as EXACTLY ONE of:
-YES, NO, CORRECTION_NAME, CORRECTION_EMAIL, CORRECTION_PHONE, UNCLEAR
+YES, NO, CORRECTION_NAME, CORRECTION_EMAIL, CORRECTION_PHONE, CORRECTION_ALL, UNCLEAR
 
 - YES: any clear affirmative ("yes", "correct", "go ahead", "confirm", "sí", "ja", "haan", etc.)
 - NO: any clear negative / wants to cancel or stop.
-- CORRECTION_NAME / CORRECTION_EMAIL / CORRECTION_PHONE: the guest says one specific field is
+- CORRECTION_NAME / CORRECTION_EMAIL / CORRECTION_PHONE: the guest says ONE specific field is
   wrong and wants to fix it (e.g. "my email is wrong", "change the phone number").
+- CORRECTION_ALL: the guest says their details are wrong in general, without naming a single
+  field (e.g. "everything is wrong", "all my details are incorrect", "my reservation data is
+  wrong").
 - UNCLEAR: anything else, including unrelated questions.
 
 Reply with ONLY the single label, nothing else.
@@ -1486,6 +1568,7 @@ Reply with ONLY the single label, nothing else.
       "CORRECTION_NAME",
       "CORRECTION_EMAIL",
       "CORRECTION_PHONE",
+      "CORRECTION_ALL",
     ];
     return valid.includes(label) ? label : "UNCLEAR";
   } catch (err) {
@@ -1736,7 +1819,11 @@ async function presentOffersOrAutoSelect({
 }
 
 // ─── Shared: an offer has just been chosen — move into guest-detail
-// collection, pre-filling from a known previous booking if one exists. ──
+// collection, pre-filling from a known previous booking if one exists.
+// Part 5: always acknowledge the selected offer before asking anything,
+// regardless of how the booking started (Part 6) — this is the single
+// entry point every booking path funnels through, so the acknowledgment
+// applies uniformly everywhere. ─────────────────────────────────────────
 async function enterGuestDetailFlow({
   sessionId,
   session,
@@ -1760,13 +1847,13 @@ async function enterGuestDetailFlow({
     ? refreshed.pendingGuestDetails
     : refreshed.knownGuestDetails;
 
+  const ackText = buildOfferAcknowledgmentText(offer?.name);
+
   if (prefillDetails) {
     logEvent(sessionId, "guest_detail_prefilled", { offer: offer?.name });
     const details = { ...prefillDetails };
-    const text = await translateToLanguage(
-      buildConfirmationText(details),
-      lang,
-    );
+    const combined = `${ackText}\n\n${buildConfirmationText(details)}`;
+    const text = await translateToLanguage(combined, lang);
     updateSession(sessionId, {
       history: [
         ...refreshed.history,
@@ -1781,7 +1868,8 @@ async function enterGuestDetailFlow({
     return reply("text", { text });
   }
 
-  const text = await translateToLanguage(ASK_NAME_SENTENCE, lang);
+  const combined = `${ackText}\n\n${ASK_NAME_SENTENCE}`;
+  const text = await translateToLanguage(combined, lang);
   updateSession(sessionId, {
     history: [
       ...refreshed.history,
@@ -1792,6 +1880,107 @@ async function enterGuestDetailFlow({
     guestDetailStep: "name",
   });
   return reply("text", { text });
+}
+
+// ─── Shared: mid-flow global intent override handler. Used from the
+// guest-detail collection steps (name / email / phone / confirm) so the
+// guest can always jump to another booking, reservation lookup, offer
+// change, or bail into an unsupported-feature refusal WITHOUT having their
+// message wrongly force-validated as a name/email/phone value (Problem 1,
+// 7, 8, 9, 14). ─────────────────────────────────────────────────────────
+async function handleBookingFlowOverride({
+  override,
+  sessionId,
+  session,
+  message,
+  property,
+  lang,
+  resumeAskSentence,
+}) {
+  const send = async (fixedText, extraUpdates = {}) => {
+    const translated = await translateToLanguage(fixedText, lang);
+    const newHistory = [
+      ...session.history,
+      { role: "user", content: message },
+      { role: "assistant", content: translated },
+    ];
+    updateSession(sessionId, { history: newHistory, ...extraUpdates });
+    return reply("text", { text: translated });
+  };
+
+  logEvent(sessionId, "booking_flow_override", { override });
+
+  // Problem 7 — guest wants an entirely NEW booking. Stop asking for the
+  // in-progress guest details and restart from the dates step, keeping the
+  // hotel already confirmed for this conversation.
+  if (override === "ANOTHER_BOOKING") {
+    updateSession(sessionId, {
+      guestDetailStep: null,
+      pendingGuestDetails: null,
+      selectedOffer: null,
+      lastOffers: null,
+      lastSearchParams: null,
+      correctingField: false,
+      correctionQueue: null,
+      searchDetailStep: "arrival",
+      pendingSearchDetails: {},
+      activeIntent: "BOOK",
+    });
+    return send(ASK_ARRIVAL_SENTENCE);
+  }
+
+  // Problem 9 — guest wants to pick a different offer. Re-show the SAME
+  // previously fetched offers (no new search), keep all already-collected
+  // guest details so the flow can resume from where they left off once a
+  // new offer is chosen (see enterGuestDetailFlow's prefill logic).
+  if (override === "CHANGE_OFFER") {
+    if (!session.lastOffers || session.lastOffers.length === 0) {
+      return send(NO_SEARCH_STATE_SENTENCE, {
+        guestDetailStep: null,
+        pendingGuestDetails: null,
+        selectedOffer: null,
+      });
+    }
+    const text = await translateToLanguage(OFFERS_INTRO_SENTENCE, lang);
+    updateSession(sessionId, {
+      history: [
+        ...session.history,
+        { role: "user", content: message },
+        { role: "assistant", content: text },
+      ],
+      guestDetailStep: null,
+      selectedOffer: null,
+      correctingField: false,
+      correctionQueue: null,
+    });
+    return reply("offers", { text, data: session.lastOffers });
+  }
+
+  // Problem 8 — guest wants to see an existing reservation instead.
+  // Immediately switch to the lookup flow; do not continue the booking.
+  if (override === "LOOKUP") {
+    updateSession(sessionId, {
+      guestDetailStep: null,
+      activeIntent: "LOOKUP",
+    });
+    return await handleActionFlow({
+      sessionId,
+      message,
+      session: sessions.get(sessionId),
+      property,
+    });
+  }
+
+  // Problem 1 (cancel / check-in / check-out examples) — give the fixed
+  // refusal, then re-ask the same field so the booking isn't derailed.
+  if (UNSUPPORTED_FEATURE_SENTENCES[override]) {
+    const combined = resumeAskSentence
+      ? `${UNSUPPORTED_FEATURE_SENTENCES[override]}\n\n${resumeAskSentence}`
+      : UNSUPPORTED_FEATURE_SENTENCES[override];
+    return send(combined);
+  }
+
+  return send(resumeAskSentence || ASK_NAME_SENTENCE);
 }
 
 // ─── Deterministic search-detail collection: check-in → check-out → adults ─
@@ -1807,6 +1996,26 @@ async function handleSearchDetailCollection({
 
   logEvent(sessionId, "search_detail_step", { step });
 
+  // Problem 1 / 7 / 8 / 14 — a message arriving while we're waiting for a
+  // check-in date, check-out date, or guest count might not be that value
+  // at all (e.g. "show my reservation" while we're waiting for the
+  // check-out date). Detect and reroute before ever attempting to parse it
+  // as a date or a number. CHANGE_OFFER doesn't apply yet at this stage
+  // (no offer has been shown), so it's excluded here.
+  const override = checkFieldOverrideIntent(message, {
+    includeChangeOffer: false,
+  });
+  if (override) {
+    return await handleSearchDetailFieldOverride({
+      override,
+      sessionId,
+      session,
+      message,
+      property,
+      lang,
+    });
+  }
+
   const send = async (fixedText, extraUpdates = {}) => {
     const translated = await translateToLanguage(fixedText, lang);
     const newHistory = [
@@ -1821,6 +2030,7 @@ async function handleSearchDetailCollection({
   if (step === "arrival") {
     const arrival = await parseDateSmart(message);
     if (!arrival) return send(INVALID_DATE_SENTENCE);
+    // Part 12/13 Case 1 — invalid (past) dates never reach the offers tool.
     if (isPastDate(arrival)) return send(PAST_DATE_SENTENCE);
     return send(ASK_DEPARTURE_SENTENCE, {
       pendingSearchDetails: { ...pending, arrival },
@@ -1841,10 +2051,24 @@ async function handleSearchDetailCollection({
   }
 
   if (step === "adults") {
-    const match = message.match(/\d{1,2}/);
-    const adults = match ? parseInt(match[0], 10) : null;
-    if (!adults || adults < 1 || adults > 10)
+    // Guest count validation — now understands digits ("3"), number words
+    // ("one", "TWO"), and natural sentences ("we are two", "there will be
+    // three adults"), not just bare digits. See parseAdultsSmart above.
+    const resolved = await parseAdultsSmart(message);
+
+    // Case: decimal input (1.5, 2.3, 3.8, etc.) — not a whole number.
+    if (resolved?.decimal) {
+      return send(INVALID_ADULTS_WHOLE_NUMBER_SENTENCE);
+    }
+
+    const adults = resolved?.value;
+    if (adults === undefined || adults === null || Number.isNaN(adults)) {
       return send(INVALID_ADULTS_SENTENCE);
+    }
+    // Case: zero or negative.
+    if (adults < 1) return send(INVALID_ADULTS_MIN_SENTENCE);
+    // Case: above the offers' supported cap.
+    if (adults > 5) return send(INVALID_ADULTS_MAX_SENTENCE);
 
     if (!property) {
       return send(NO_SEARCH_STATE_SENTENCE, {
@@ -1879,6 +2103,67 @@ async function handleSearchDetailCollection({
   });
 }
 
+// ─── Mid-flow override handler for the search-detail (dates/adults) steps.
+// Mirrors handleBookingFlowOverride but resets searchDetailStep instead of
+// guestDetailStep, since no guest details exist yet at this stage. ────────
+async function handleSearchDetailFieldOverride({
+  override,
+  sessionId,
+  session,
+  message,
+  property,
+  lang,
+}) {
+  const send = async (fixedText, extraUpdates = {}) => {
+    const translated = await translateToLanguage(fixedText, lang);
+    const newHistory = [
+      ...session.history,
+      { role: "user", content: message },
+      { role: "assistant", content: translated },
+    ];
+    updateSession(sessionId, { history: newHistory, ...extraUpdates });
+    return reply("text", { text: translated });
+  };
+
+  logEvent(sessionId, "search_detail_field_override", { override });
+
+  if (override === "ANOTHER_BOOKING") {
+    updateSession(sessionId, {
+      searchDetailStep: "arrival",
+      pendingSearchDetails: {},
+      selectedOffer: null,
+      lastOffers: null,
+      lastSearchParams: null,
+      activeIntent: "BOOK",
+    });
+    return send(ASK_ARRIVAL_SENTENCE);
+  }
+
+  if (override === "LOOKUP") {
+    updateSession(sessionId, {
+      searchDetailStep: null,
+      pendingSearchDetails: null,
+      activeIntent: "LOOKUP",
+    });
+    return await handleActionFlow({
+      sessionId,
+      message,
+      session: sessions.get(sessionId),
+      property,
+    });
+  }
+
+  if (UNSUPPORTED_FEATURE_SENTENCES[override]) {
+    const reask = askSentenceForSearchStep(session.searchDetailStep);
+    return send(`${UNSUPPORTED_FEATURE_SENTENCES[override]}\n\n${reask}`);
+  }
+
+  return send(ASK_ARRIVAL_SENTENCE, {
+    searchDetailStep: "arrival",
+    pendingSearchDetails: {},
+  });
+}
+
 // ─── Deterministic guest-detail collection + booking confirmation ─────────
 async function handleGuestDetailCollection({
   sessionId,
@@ -1903,7 +2188,52 @@ async function handleGuestDetailCollection({
     return reply("text", { text: translated });
   };
 
+  // Part 8 — shared helper: guest cancels a specific field correction
+  // ("Sorry, my email is actually correct.") while `pending` still holds
+  // the ORIGINAL value (we never overwrote it), so re-using it as-is is
+  // exactly "using the original email/phone/name".
+  const handleCorrectionKeep = async () => {
+    const queue = session.correctionQueue || [];
+    if (queue.length > 0) {
+      const [nextField, ...rest] = queue;
+      return send(getCorrectionAskSentence(nextField), {
+        guestDetailStep: FIELD_TO_STEP[nextField],
+        correctingField: true,
+        correctionQueue: rest,
+      });
+    }
+    return send(buildConfirmationText(pending), {
+      guestDetailStep: "confirm",
+      correctingField: false,
+      correctionQueue: null,
+    });
+  };
+
   if (step === "name") {
+    if (session.correctingField && CORRECTION_KEEP_REGEX.test(message)) {
+      return handleCorrectionKeep();
+    }
+
+    // Problem 1 / 7 / 8 / 9 / 14 — before treating this message as the
+    // guest's full name, check whether they're actually expressing a
+    // completely different intent (another booking, a reservation lookup,
+    // an offer change, or an unsupported request).
+    const override = checkFieldOverrideIntent(message);
+    if (override) {
+      return await handleBookingFlowOverride({
+        override,
+        sessionId,
+        session,
+        message,
+        property,
+        lang,
+        resumeAskSentence: askSentenceForGuestStep(
+          "name",
+          session.correctingField,
+        ),
+      });
+    }
+
     const fullName = message.trim();
     if (fullName.length < 2) return send(INVALID_NAME_SENTENCE);
 
@@ -1933,6 +2263,29 @@ async function handleGuestDetailCollection({
   }
 
   if (step === "email") {
+    if (session.correctingField && CORRECTION_KEEP_REGEX.test(message)) {
+      return handleCorrectionKeep();
+    }
+
+    // Problem 1 / 7 / 8 / 9 / 14 — same override check as the name step.
+    // This is exactly the bug shown in production: "I want another room"
+    // while waiting for an email must NOT be validated as an email.
+    const override = checkFieldOverrideIntent(message);
+    if (override) {
+      return await handleBookingFlowOverride({
+        override,
+        sessionId,
+        session,
+        message,
+        property,
+        lang,
+        resumeAskSentence: askSentenceForGuestStep(
+          "email",
+          session.correctingField,
+        ),
+      });
+    }
+
     const email = message.trim();
     if (!EMAIL_REGEX.test(email)) return send(INVALID_EMAIL_SENTENCE);
 
@@ -1962,6 +2315,27 @@ async function handleGuestDetailCollection({
   }
 
   if (step === "phone") {
+    if (session.correctingField && CORRECTION_KEEP_REGEX.test(message)) {
+      return handleCorrectionKeep();
+    }
+
+    // Problem 1 / 7 / 8 / 9 / 14 — same override check as name/email.
+    const override = checkFieldOverrideIntent(message);
+    if (override) {
+      return await handleBookingFlowOverride({
+        override,
+        sessionId,
+        session,
+        message,
+        property,
+        lang,
+        resumeAskSentence: askSentenceForGuestStep(
+          "phone",
+          session.correctingField,
+        ),
+      });
+    }
+
     const phone = message.trim();
     if (!isValidPhone(phone)) return send(INVALID_PHONE_SENTENCE);
 
@@ -1987,16 +2361,8 @@ async function handleGuestDetailCollection({
   }
 
   if (step === "confirm") {
-    // Fixed: previously we ALWAYS ran classifyConfirmationReply first, which
-    // returns only a single label (YES / NO / CORRECTION_NAME /
-    // CORRECTION_EMAIL / CORRECTION_PHONE / UNCLEAR). When the guest
-    // corrected multiple fields in one message (e.g. "no my email is X,
-    // phone is Y, name is Z"), only ONE field's correction was ever acted
-    // on, and the other values the guest already gave were discarded —
-    // forcing them to re-type a field they'd just supplied.
-    //
-    // Now we scan the message directly for any valid email/phone/name the
-    // guest supplied inline. If we find any, we apply ALL of them at once
+    // Priority 1: the guest supplied actual new values inline (e.g. "no my
+    // email is X and phone is Y and name is Z") — apply ALL of them at once
     // and re-show the confirmation immediately, instead of asking again.
     const extracted = extractCorrectionFields(message);
     const hasValidCorrection = Boolean(
@@ -2034,6 +2400,63 @@ async function handleGuestDetailCollection({
       });
     }
 
+    // Priority 1.5 (Problem 1 / 7 / 8 / 9 / 14) — the guest isn't
+    // confirming, declining, or correcting a field at all: they're
+    // expressing a completely different intent (another booking, a
+    // reservation lookup, an offer change, or an unsupported request).
+    const override = checkFieldOverrideIntent(message);
+    if (override) {
+      return await handleBookingFlowOverride({
+        override,
+        sessionId,
+        session,
+        message,
+        property,
+        lang,
+        resumeAskSentence: buildConfirmationText(pending),
+      });
+    }
+
+    // Priority 2 (Part 7 Case 5): "everything is wrong" / "all my details
+    // are incorrect" / "my reservation data is wrong" — restart full
+    // personal-info collection (name → email → phone only; offer, dates,
+    // and guest count are untouched).
+    if (ALL_DETAILS_WRONG_REGEX.test(message)) {
+      logEvent(sessionId, "guest_detail_restart_all", {});
+      // Fixed: do NOT reset pendingGuestDetails to {} here — that wiped out
+      // valid existing values (e.g. email), so a later "my email is
+      // correct" had nothing left to keep and stored `undefined`. Keep
+      // `pending` as-is; each field gets overwritten only if the guest
+      // actually supplies a new value for it.
+      return send(ASK_CORRECTION_NAME_SENTENCE, {
+        guestDetailStep: "name",
+        correctingField: true,
+        correctionQueue: ["email", "phone"],
+      });
+    }
+
+    // Priority 3 (Part 7 Case 3): guest names two or more fields as wrong,
+    // without giving new values ("my email and phone number are incorrect")
+    // — queue them so each is asked in turn.
+    const fieldsToAsk = [];
+    if (MENTIONS_NAME_FIELD_REGEX.test(message)) fieldsToAsk.push("fullName");
+    if (MENTIONS_EMAIL_FIELD_REGEX.test(message)) fieldsToAsk.push("email");
+    if (MENTIONS_PHONE_FIELD_REGEX.test(message)) fieldsToAsk.push("phone");
+
+    if (fieldsToAsk.length > 1) {
+      const [first, ...rest] = fieldsToAsk;
+      logEvent(sessionId, "guest_detail_field_correction_queued", {
+        fields: fieldsToAsk.join(","),
+      });
+      return send(getCorrectionAskSentence(first), {
+        guestDetailStep: FIELD_TO_STEP[first],
+        correctingField: true,
+        correctionQueue: rest,
+      });
+    }
+
+    // Priority 4: single-field correction, plain yes/no, or unclear — the
+    // LLM classifier handles nuance here.
     const label = await classifyConfirmationReply(message);
     logEvent(sessionId, "booking_confirmation_classified", { label });
 
@@ -2138,6 +2561,16 @@ async function handleGuestDetailCollection({
         guestDetailStep: "phone",
         correctingField: true,
       });
+    if (label === "CORRECTION_ALL") {
+      logEvent(sessionId, "guest_detail_restart_all", {});
+      // Fixed: same as the ALL_DETAILS_WRONG_REGEX branch above — keep
+      // `pending` intact so untouched fields aren't lost to `undefined`.
+      return send(ASK_CORRECTION_NAME_SENTENCE, {
+        guestDetailStep: "name",
+        correctingField: true,
+        correctionQueue: ["email", "phone"],
+      });
+    }
 
     return send(UNCLEAR_CONFIRMATION_SENTENCE);
   }
@@ -2180,7 +2613,40 @@ async function handleGuestDetailCollection({
       });
     }
 
-    // Priority 2: guest wants a different room (Problem 3) — re-show the
+    // Priority 1.5 (Problem 8 / 14) — guest wants to look up an existing
+    // reservation, or hits an unsupported feature, right after declining
+    // the confirmation. ANOTHER_BOOKING and CHANGE_OFFER are intentionally
+    // left to the WANTS_ANOTHER_ROOM_REGEX / WANTS_CANCEL_BOOKING_REGEX
+    // checks below, which already cover this step's own phrasing.
+    const overrideHere = checkFieldOverrideIntent(message, {
+      includeChangeOffer: false,
+    });
+    if (overrideHere === "LOOKUP" || UNSUPPORTED_FEATURE_SENTENCES[overrideHere]) {
+      return await handleBookingFlowOverride({
+        override: overrideHere,
+        sessionId,
+        session,
+        message,
+        property,
+        lang,
+        resumeAskSentence: BOOKING_CANCELLED_SENTENCE,
+      });
+    }
+
+    // Priority 2 (Part 7 Case 5): "everything is wrong" — restart full
+    // personal-info collection (name → email → phone only).
+    if (ALL_DETAILS_WRONG_REGEX.test(message)) {
+      logEvent(sessionId, "post_decline_restart_all", {});
+      // Fixed: same undefined-value bug as the "confirm" step — don't wipe
+      // pendingGuestDetails, just re-collect name/email/phone on top of it.
+      return send(ASK_CORRECTION_NAME_SENTENCE, {
+        guestDetailStep: "name",
+        correctingField: true,
+        correctionQueue: ["email", "phone"],
+      });
+    }
+
+    // Priority 3: guest wants a different room (Problem 3) — re-show the
     // SAME previously fetched offers, no new search, no hotel re-ask.
     if (WANTS_ANOTHER_ROOM_REGEX.test(message)) {
       if (!session.lastOffers || session.lastOffers.length === 0) {
@@ -2208,7 +2674,7 @@ async function handleGuestDetailCollection({
       return reply("offers", { text, data: session.lastOffers });
     }
 
-    // Priority 3: guest explicitly wants to cancel the booking outright —
+    // Priority 4: guest explicitly wants to cancel the booking outright —
     // only NOW is it safe to clear the booking state (Problem 9).
     if (WANTS_CANCEL_BOOKING_REGEX.test(message)) {
       logEvent(sessionId, "post_decline_cancel", {});
@@ -2223,7 +2689,7 @@ async function handleGuestDetailCollection({
       });
     }
 
-    // Priority 4: guest names which field(s) are wrong without giving new
+    // Priority 5: guest names which field(s) are wrong without giving new
     // values yet (e.g. "my email and phone number are wrong") — queue them
     // and ask for each value in turn, ending on the full confirmation card.
     const fieldsToAsk = [];
@@ -2243,7 +2709,7 @@ async function handleGuestDetailCollection({
       });
     }
 
-    // Priority 5: unclear — re-ask the same deterministic prompt. State
+    // Priority 6: unclear — re-ask the same deterministic prompt. State
     // stays untouched (still "postDecline").
     return send(BOOKING_CANCELLED_SENTENCE);
   }
@@ -2255,16 +2721,24 @@ async function handleGuestDetailCollection({
 }
 
 // ═════════════════════════════════════════════════════════════════════════
-// Deterministic action flow (cancel / check-in / check-out / lookup)
+// Deterministic action flow — LOOKUP only.
+//
+// NOTE (production simplification): this used to also drive check-in,
+// check-out, and cancellation after the guest verified their reservation
+// (a "confirmAction" step that asked "Shall I check in/out/cancel now?" and
+// then called the matching tool). Those three features have been removed
+// entirely per the client requirement — the only actionIntent that ever
+// reaches this function now is "LOOKUP", which always terminates as soon as
+// the reservation is found, so the confirmAction step, its yes/no
+// classification, and its PMS-error sanitization are gone as dead code.
+// The phone/room+DOB verification steps below are unchanged, since LOOKUP
+// still needs to verify the guest's identity before revealing anything.
 // ═════════════════════════════════════════════════════════════════════════
 async function handleActionFlow({ sessionId, message, session, property }) {
   const lang = session.lastKnownLanguage || "English";
-  const activeIntent = session.activeIntent;
   const step = session.actionFlowStep;
-  const pending = session.pendingVerification || {};
 
   logEvent(sessionId, "action_flow_step", {
-    activeIntent,
     step: step || "start",
     property: property?.name,
   });
@@ -2279,6 +2753,25 @@ async function handleActionFlow({ sessionId, message, session, property }) {
     updateSession(sessionId, { history: newHistory, ...extraUpdates });
     return reply("text", { text: translated });
   };
+
+  // Problem 7 / 14 — even mid-verification, the guest may suddenly want to
+  // start a brand new booking instead of continuing to verify an existing
+  // reservation. Only ANOTHER_BOOKING is checked here (not CHANGE_OFFER,
+  // which doesn't apply, and not LOOKUP/CANCEL/CHECKIN/CHECKOUT, which
+  // would just be noise while already inside the lookup flow itself).
+  if (step === "verifyPhone" || step === "verifyAlt") {
+    if (ANOTHER_BOOKING_REGEX.test(message)) {
+      logEvent(sessionId, "action_flow_override", { override: "ANOTHER_BOOKING" });
+      updateSession(sessionId, {
+        actionFlowStep: null,
+        pendingVerification: null,
+        activeIntent: "BOOK",
+        searchDetailStep: "arrival",
+        pendingSearchDetails: {},
+      });
+      return send(ASK_ARRIVAL_SENTENCE);
+    }
+  }
 
   const lookupAndAdvance = async (toolInput, viaStep) => {
     const result = await executeTool({
@@ -2320,22 +2813,12 @@ async function handleActionFlow({ sessionId, message, session, property }) {
 
     logEvent(sessionId, "reservation_resolved", {
       reservationId: reservation.reservationId,
-      activeIntent,
     });
 
-    if (activeIntent === "LOOKUP") {
-      return send(buildReservationDetailText(reservation), {
-        actionFlowStep: null,
-        pendingVerification: null,
-        resolvedActionReservation: null,
-        activeIntent: null,
-        lastReservations: null,
-      });
-    }
-
-    return send(buildActionConfirmText(activeIntent, reservation), {
-      actionFlowStep: "confirmAction",
-      resolvedActionReservation: reservation,
+    return send(buildReservationDetailText(reservation), {
+      actionFlowStep: null,
+      pendingVerification: null,
+      activeIntent: null,
       lastReservations: null,
     });
   };
@@ -2416,120 +2899,11 @@ async function handleActionFlow({ sessionId, message, session, property }) {
       return send(buildReservationListText(session.lastReservations || []));
     }
 
-    if (activeIntent === "LOOKUP") {
-      return send(buildReservationDetailText(resolution.reservation), {
-        actionFlowStep: null,
-        pendingVerification: null,
-        resolvedActionReservation: null,
-        activeIntent: null,
-        lastReservations: null,
-      });
-    }
-
-    return send(buildActionConfirmText(activeIntent, resolution.reservation), {
-      actionFlowStep: "confirmAction",
-      resolvedActionReservation: resolution.reservation,
-      lastReservations: null,
-    });
-  }
-
-  if (step === "confirmAction") {
-    const reservation = session.resolvedActionReservation;
-    if (!reservation) {
-      return send(ASK_PHONE_VERIFY_SENTENCE, {
-        actionFlowStep: "verifyPhone",
-        pendingVerification: {},
-      });
-    }
-
-    const switchedIntent = detectExplicitActionSwitch(message, activeIntent);
-    if (switchedIntent) {
-      logEvent(sessionId, "action_intent_switched_mid_confirm", {
-        from: activeIntent,
-        to: switchedIntent,
-      });
-
-      if (switchedIntent === "LOOKUP") {
-        return send(buildReservationDetailText(reservation), {
-          actionFlowStep: null,
-          pendingVerification: null,
-          resolvedActionReservation: null,
-          activeIntent: null,
-          lastReservations: null,
-        });
-      }
-
-      return send(buildActionConfirmText(switchedIntent, reservation), {
-        actionFlowStep: "confirmAction",
-        resolvedActionReservation: reservation,
-        activeIntent: switchedIntent,
-      });
-    }
-
-    const label = await classifyYesNo(
-      message,
-      buildActionConfirmText(activeIntent, reservation),
-    );
-    logEvent(sessionId, "action_confirmation_classified", { label, activeIntent });
-
-    if (label === "NO") {
-      return send(ACTION_ABORTED_SENTENCE, {
-        actionFlowStep: null,
-        pendingVerification: null,
-        resolvedActionReservation: null,
-        activeIntent: null,
-      });
-    }
-
-    if (label !== "YES") {
-      if (RESERVATION_INFO_QUERY_REGEX.test(message)) {
-        const detail = buildReservationDetailText(reservation);
-        const reask = buildActionConfirmText(activeIntent, reservation);
-        return send(`${detail}\n\n${reask}`);
-      }
-      return send(UNCLEAR_ACTION_CONFIRMATION_SENTENCE);
-    }
-
-    const toolName = ACTION_TOOL_NAME[activeIntent];
-    if (!toolName) {
-      logEvent(sessionId, "action_tool_unrecognized", { activeIntent });
-      return send(ACTION_UNRECOGNIZED_SENTENCE, {
-        actionFlowStep: null,
-        pendingVerification: null,
-        resolvedActionReservation: null,
-        activeIntent: null,
-      });
-    }
-
-    const result = await executeTool({
-      toolName,
-      toolInput: { reservationId: reservation.reservationId },
-      session,
-      property,
-    });
-
-    if (!result || result.success === false) {
-      logEvent(sessionId, "action_execute_failed", {
-        toolName,
-        reservationId: reservation.reservationId,
-        error: result?.error,
-      });
-      const pmsReason = result?.error;
-      const text = sanitizePmsMessage(pmsReason) || ACTION_FAILED_SENTENCE;
-      return send(text, { actionFlowStep: "confirmAction" });
-    }
-
-    logEvent(sessionId, "action_execute_success", {
-      toolName,
-      reservationId: reservation.reservationId,
-    });
-
-    const successText = ACTION_SUCCESS_SENTENCES[activeIntent] || "Done.";
-    return send(successText, {
+    return send(buildReservationDetailText(resolution.reservation), {
       actionFlowStep: null,
       pendingVerification: null,
-      resolvedActionReservation: null,
       activeIntent: null,
+      lastReservations: null,
     });
   }
 
@@ -3118,9 +3492,6 @@ ${ragContext}
 // Narrow the tool array by active intent
 // ═════════════════════════════════════════════════════════════════════════
 const INTENT_TOOL_NAMES = {
-  CANCEL: ["getReservation", "cancelReservation"],
-  CHECK_IN: ["getReservation", "checkIn"],
-  CHECK_OUT: ["getReservation", "checkOut"],
   LOOKUP: ["getReservation"],
 };
 
@@ -3391,9 +3762,18 @@ async function handleWithProperties({
     }
 
     const extracted = extractQuickBookingDetails(message);
+
+    // Part 12/13 Case 1 — a past arrival date must be told to the guest
+    // explicitly, never silently dropped and never sent to getOffers.
     if (extracted.arrival && isPastDate(extracted.arrival)) {
-      delete extracted.arrival;
-      delete extracted.departure;
+      logEvent(sessionId, "quick_booking_past_date", { arrival: extracted.arrival });
+      const text = await translateToLanguage(PAST_DATE_SENTENCE, language);
+      updateSession(sessionId, {
+        searchDetailStep: "arrival",
+        pendingSearchDetails: {},
+        history: [...history, { role: "assistant", content: text }],
+      });
+      return reply("text", { text });
     }
     if (
       extracted.arrival &&
@@ -3488,32 +3868,24 @@ async function handleWithProperties({
     });
   }
 
+  // Part 1 & 2 — check-in, check-out, and cancellation no longer exist as
+  // features. Recognize the guest's intent and reply in plain text — no
+  // tool is ever called, and no hotel selection or verification flow is
+  // ever entered for these.
   if (
     intent === "ACTION_REQUEST" &&
-    (actionIntent === "CANCEL" ||
-      actionIntent === "CHECK_IN" ||
-      actionIntent === "CHECK_OUT")
+    (actionIntent === "CANCEL_UNSUPPORTED" ||
+      actionIntent === "CHECKIN_UNSUPPORTED" ||
+      actionIntent === "CHECKOUT_UNSUPPORTED")
   ) {
-    logEvent(sessionId, "route", { branch: actionIntent.toLowerCase(), mentioned: Boolean(mentioned) });
-
-    if (!mentioned) {
-      const text = await translateToLanguage(
-        buildAskHotelText(properties, false),
-        language,
-      );
-      updateSession(sessionId, {
-        awaitingHotelForAction: true,
-        history: [...history, { role: "assistant", content: text }],
-      });
-      return reply("text", { text });
-    }
-
-    return await handleActionFlow({
-      sessionId,
-      message,
-      session: sessions.get(sessionId),
-      property: mentioned,
+    logEvent(sessionId, "route", { branch: "unsupported_feature_request", actionIntent });
+    const sentence = UNSUPPORTED_FEATURE_SENTENCES[actionIntent];
+    const text = await translateToLanguage(sentence, language);
+    updateSession(sessionId, {
+      activeIntent: null,
+      history: [...history, { role: "assistant", content: text }],
     });
+    return reply("text", { text });
   }
 
   if (intent === "ACTION_REQUEST" && (!actionIntent || actionIntent === "NONE")) {
@@ -3533,6 +3905,14 @@ async function handleWithProperties({
 
     if (FEEDBACK_REGEX.test(message)) {
       const text = await translateToLanguage(FEEDBACK_REFUSAL_SENTENCE, language);
+      updateSession(sessionId, {
+        history: [...history, { role: "assistant", content: text }],
+      });
+      return reply("text", { text });
+    }
+
+    if (EMAIL_RESEND_REGEX.test(message)) {
+      const text = await translateToLanguage(EMAIL_UNSUPPORTED_SENTENCE, language);
       updateSession(sessionId, {
         history: [...history, { role: "assistant", content: text }],
       });

@@ -11,6 +11,8 @@ const BASE_URL = "https://api.innolink.technology/api/pms/apaleo/properties";
 // a slow/hanging call fails FAST and predictably instead of blocking the
 // whole chat turn. Tune API_TIMEOUT_MS to whatever your real Apaleo p99
 // latency is — 15s is a reasonable starting point for guest-facing chat.
+// (checkIn/checkOut/cancelReservation have since been removed entirely — see
+// below — but this timeout still applies to every remaining call.)
 const API_TIMEOUT_MS = 15000;
 
 /**
@@ -20,14 +22,18 @@ const API_TIMEOUT_MS = 15000;
  *
  * NOTE: getRoomPasscode, submitFeedback, and sendWhatsappRecovery have been
  * removed entirely — these tools no longer exist anywhere in the system.
+ *
+ * NOTE (client requirement — production simplification): checkIn, checkOut,
+ * and cancelReservation have been removed entirely — their executor
+ * implementations and switch cases no longer exist. Only getReservation,
+ * getOffers, and createBooking remain.
  */
 export async function executeTool({ toolName, toolInput, session, property }) {
   const propertyId = property.apaleoCode;
 
   // DEBUG — log exactly what's being sent for every tool call. This is the
   // first thing to check: if propertyId or apiKey is missing/wrong, every
-  // getReservation/cancelReservation call will fail before it even reaches
-  // the PMS correctly.
+  // getReservation call will fail before it even reaches the PMS correctly.
   console.log(
     `[toolExecutor] CALL toolName=${toolName} propertyId=${propertyId} apiKeyPresent=${Boolean(
       property?.apiKey,
@@ -57,15 +63,6 @@ export async function executeTool({ toolName, toolInput, session, property }) {
       break;
     case "createBooking":
       result = await createBooking({ propertyId, toolInput, headers });
-      break;
-    case "checkIn":
-      result = await checkIn({ propertyId, toolInput, headers });
-      break;
-    case "checkOut":
-      result = await checkOut({ propertyId, toolInput, headers });
-      break;
-    case "cancelReservation":
-      result = await cancelReservation({ propertyId, toolInput, headers });
       break;
     default:
       throw new AppError(`Unknown tool: ${toolName}`, 400);
@@ -155,30 +152,6 @@ async function createBooking({ propertyId, toolInput, headers }) {
       },
     }),
   });
-}
-
-async function checkIn({ propertyId, toolInput, headers }) {
-  const { reservationId } = toolInput;
-  return await apiCall(
-    `${BASE_URL}/${propertyId}/voice/reservations/${reservationId}/check-in`,
-    { method: "POST", headers },
-  );
-}
-
-async function checkOut({ propertyId, toolInput, headers }) {
-  const { reservationId } = toolInput;
-  return await apiCall(
-    `${BASE_URL}/${propertyId}/voice/reservations/${reservationId}/check-out`,
-    { method: "POST", headers },
-  );
-}
-
-async function cancelReservation({ propertyId, toolInput, headers }) {
-  const { reservationId } = toolInput;
-  return await apiCall(
-    `${BASE_URL}/${propertyId}/voice/reservations/${reservationId}/cancel`,
-    { method: "POST", headers },
-  );
 }
 
 // ─── Shared fetch helper ───────────────────────────────────────────────────

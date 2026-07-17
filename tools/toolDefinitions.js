@@ -5,6 +5,12 @@
 // NOTE: getRoomPasscode, submitFeedback, and sendWhatsappRecovery have been
 // removed entirely — these tools no longer exist anywhere in the system.
 //
+// NOTE (client requirement — production simplification): checkIn, checkOut,
+// and cancelReservation have been removed entirely. The chatbot no longer
+// performs online check-in/check-out or cancellations. Guests who ask for
+// these are recognized by intent in chatbot.service.js and given a plain-
+// text refusal — no tool is ever registered or called for them.
+//
 // NOTE: createBooking is defined here for documentation/executor reuse only.
 // It is intentionally NOT included in `all` — the LLM never sees or calls
 // this tool. Booking is completed by deterministic code (see
@@ -12,13 +18,11 @@
 // gone through sequential detail collection and explicitly confirmed. This
 // removes booking-with-real-money decisions from LLM judgment entirely.
 //
-// CHANGE LOG (review fixes — see chatbot.service.js for the actual logic):
-// - No schema changes were required for Problems 1-6. Reservation-reference
-//   resolution ("last one", "the confirmed one", etc.) is handled entirely in
-//   the service layer against the array getReservation already returns when
-//   multiple matches come back — it does not need a new tool or a new field
-//   here. Keeping this file's surface area untouched is intentional: your
-//   executor and getReservation's multi-match contract are unchanged.
+// CHANGE LOG (production simplification pass):
+// - Removed checkIn, checkOut, cancelReservation tool definitions (see NOTE
+//   above). `all` now only contains getReservation and getOffers.
+// - Guest count cap lowered from 10 to 5 across getOffers/createBooking
+//   schemas — offers only support up to 5 adults.
 
 const selectProperty = {
   type: "function",
@@ -83,7 +87,7 @@ const getOffers = {
   function: {
     name: "getOffers",
     description:
-      "List available rate plans for given arrival, departure, and adults. Infer adults from room intent (single=1, double=2, triple=3). Dates must be YYYY-MM-DD; departure must be after arrival. Once this returns, the app shows the offers to the guest and handles the rest of the booking flow automatically — you do not need (and cannot) call createBooking yourself.",
+      "List available rate plans for given arrival, departure, and adults. Infer adults from room intent (single=1, double=2, triple=3). Dates must be YYYY-MM-DD; departure must be after arrival. Offers only support up to 5 adults. Once this returns, the app shows the offers to the guest and handles the rest of the booking flow automatically — you do not need (and cannot) call createBooking yourself.",
     parameters: {
       type: "object",
       required: ["arrival", "departure", "adults"],
@@ -98,7 +102,9 @@ const getOffers = {
         },
         adults: {
           type: "integer",
-          description: "Number of adults 1–10",
+          description: "Number of adults 1–5",
+          minimum: 1,
+          maximum: 5,
         },
       },
     },
@@ -128,69 +134,17 @@ const createBooking = {
       properties: {
         arrival: { type: "string", description: "YYYY-MM-DD" },
         departure: { type: "string", description: "YYYY-MM-DD" },
-        adults: { type: "integer", description: "Number of adults 1–10" },
+        adults: {
+          type: "integer",
+          description: "Number of adults 1–5",
+          minimum: 1,
+          maximum: 5,
+        },
         ratePlanId: { type: "string", description: "From getOffers e.g. RPL-SINGLE-STD" },
         guestFirstName: { type: "string", description: "Guest first name" },
         guestLastName: { type: "string", description: "Guest last name" },
         guestPhone: { type: "string", description: "E.164 format e.g. +491234567890" },
         guestEmail: { type: "string", description: "Valid email address." },
-      },
-    },
-  },
-};
-
-const checkIn = {
-  type: "function",
-  function: {
-    name: "checkIn",
-    description:
-      "Perform check-in for a reservation. Rules: no negative folio balance; earliest check-in is 14:00 on arrival day. Resolve the reservationId via getReservation first if it isn't already known — never ask the guest for a raw reservation ID by name, use phone last 4 or name+DOB+room instead.",
-    parameters: {
-      type: "object",
-      required: ["reservationId"],
-      properties: {
-        reservationId: {
-          type: "string",
-          description: "Apaleo reservation id e.g. ABC-1",
-        },
-      },
-    },
-  },
-};
-
-const checkOut = {
-  type: "function",
-  function: {
-    name: "checkOut",
-    description:
-      "Check out a guest. Reservation must be in checked-in (in-house) status and balance must not be negative.",
-    parameters: {
-      type: "object",
-      required: ["reservationId"],
-      properties: {
-        reservationId: {
-          type: "string",
-          description: "Apaleo reservation id",
-        },
-      },
-    },
-  },
-};
-
-const cancelReservation = {
-  type: "function",
-  function: {
-    name: "cancelReservation",
-    description:
-      "Cancel an existing reservation. Not allowed if the guest has already checked out. Confirm reservationId before calling.",
-    parameters: {
-      type: "object",
-      required: ["reservationId"],
-      properties: {
-        reservationId: {
-          type: "string",
-          description: "Apaleo reservation id e.g. ABC-1",
-        },
       },
     },
   },
@@ -206,6 +160,8 @@ export const toolDefinitions = {
   createBooking,
 
   // all tools the LLM is allowed to call once a property is locked (active state).
-  // createBooking is deliberately excluded — see note above.
-  all: [getReservation, getOffers, checkIn, checkOut, cancelReservation],
+  // createBooking is deliberately excluded — see note above. checkIn, checkOut,
+  // and cancelReservation have been removed entirely per the production
+  // simplification — they no longer exist as tools anywhere in the system.
+  all: [getReservation, getOffers],
 };
