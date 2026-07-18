@@ -270,12 +270,13 @@ const PASSCODE_REFUSAL_SENTENCE =
 
 const ASK_NAME_SENTENCE = "Please enter your full name.";
 const ASK_EMAIL_SENTENCE = "Please enter your email address.";
-const ASK_PHONE_SENTENCE = "Please enter your phone number.";
+const ASK_PHONE_SENTENCE =
+  "Please enter your phone number, including the country code (e.g. +49, +92, +44).";
 const INVALID_NAME_SENTENCE = "Please enter your full name.";
 const INVALID_EMAIL_SENTENCE =
   "That doesn't look like a valid email. Please try again.";
 const INVALID_PHONE_SENTENCE =
-  "That doesn't look like a valid phone number. Please include your country code and try again.";
+  "Please enter your phone number including the country code. For example: +49..., +92..., +44...";
 const BOOKING_CANCELLED_SENTENCE =
   "No problem. Could you please tell me which reservation details you'd like to change?";
 const BOOKING_CANCELLED_FINAL_SENTENCE =
@@ -290,7 +291,8 @@ const UNCLEAR_CONFIRMATION_SENTENCE =
   "Please reply yes to confirm, or let me know what to correct.";
 const ASK_CORRECTION_NAME_SENTENCE = "What's the correct full name?";
 const ASK_CORRECTION_EMAIL_SENTENCE = "What's the correct email address?";
-const ASK_CORRECTION_PHONE_SENTENCE = "What's the correct phone number?";
+const ASK_CORRECTION_PHONE_SENTENCE =
+  "What's the correct phone number, including the country code?";
 const NO_SEARCH_STATE_SENTENCE =
   "Let's start over. Please tell me which hotel you'd like to book.";
 
@@ -351,6 +353,11 @@ const CANCEL_UNSUPPORTED_SENTENCE =
   "Sorry, I can't cancel reservations through this chat.";
 const EMAIL_UNSUPPORTED_SENTENCE =
   "Sorry, I can't send emails from this chat.";
+
+// Task 3 — room change/upgrade requests for an existing assignment are not
+// something this chat can perform; direct the guest to the front desk.
+const ROOM_CHANGE_UNSUPPORTED_SENTENCE =
+  "I'm sorry, but I can't change room assignments through this chat. Please contact the hotel front desk, and they'll be happy to help you with room changes, subject to availability.";
 
 const UNSUPPORTED_FEATURE_SENTENCES = {
   CANCEL_UNSUPPORTED: CANCEL_UNSUPPORTED_SENTENCE,
@@ -416,6 +423,18 @@ function buildConfirmationText({ fullName, email, phone }) {
     "",
     "Shall I proceed with this booking?",
   ].join("\n");
+}
+
+// Task 4 — summarize a proposed change to check-in/check-out/adults and ask
+// for confirmation before re-searching offers.
+function buildModificationConfirmationText(params) {
+  const lines = ["I've updated your booking request.", ""];
+  if (params.arrival) lines.push(`**Check-in:** ${params.arrival}`);
+  if (params.departure) lines.push(`**Check-out:** ${params.departure}`);
+  if (params.adults) lines.push(`**Adults:** ${params.adults}`);
+  lines.push("");
+  lines.push("Would you like me to search for available rooms with these updated details?");
+  return lines.join("\n");
 }
 
 function buildAskHotelText(properties, isBooking) {
@@ -506,6 +525,15 @@ const QUICK_REPEAT_REGEX =
   /\b(same (hotel|dates?|details?)|as before|as last time|again|quick reservation|repeat (the )?(same|last|previous))\b/i;
 const CHEAPEST_REGEX = /cheap/i;
 
+// ─── Task 3 — room change / upgrade requests for an EXISTING assignment.
+// This is distinct from CHANGE_OFFER_MIDFLOW_REGEX below (which is about
+// picking a different OFFER during an in-progress booking, before it's
+// confirmed): this one is a guest asking, generally, to have their room
+// swapped/upgraded — something no tool exists for, so it's answered with a
+// plain, polite redirect to the front desk. ─────────────────────────────────
+const ROOM_CHANGE_REQUEST_REGEX =
+  /\b(change (my |the )?room\b|(another|different|new) room\b(?!\s*(number|type)? ?(preference)?)|upgrade (my |the )?room\b|switch (my |the )?room\b|move me to another room\b|room change\b|swap (my |the )?room\b)/i;
+
 // ─── Post-decline classification (Problems 1-3, 9): after the guest says
 // "No" to a booking confirmation, these deterministically classify what
 // they want next WITHOUT involving the LLM, per the "deterministic flow"
@@ -517,6 +545,12 @@ const WANTS_CANCEL_BOOKING_REGEX =
 const MENTIONS_NAME_FIELD_REGEX = /\bname\b/i;
 const MENTIONS_EMAIL_FIELD_REGEX = /\bemail\b/i;
 const MENTIONS_PHONE_FIELD_REGEX = /\b(phone|number)\b/i;
+
+// Task 1/6 — a message that describes a field as wrong/incorrect, used to
+// detect that the guest is redirecting to a DIFFERENT field than the one
+// currently being collected, rather than supplying a value for it.
+const WRONG_INDICATOR_REGEX =
+  /\b(wrong|incorrect|invalid|not correct|isn'?t correct|is not correct|also wrong|too|as well|mistaken|not right)\b/i;
 
 // Part 7 Case 5 — "everything is wrong" / "all my details are incorrect" /
 // "my reservation data is wrong" — restart full personal-info collection.
@@ -575,6 +609,54 @@ function checkFieldOverrideIntent(message, { includeChangeOffer = true } = {}) {
   if (CHECKOUT_INTENT_REGEX.test(message)) return "CHECKOUT_UNSUPPORTED";
   return null;
 }
+
+// ─── Task 1/6 — generic "does this message actually redirect to a
+// DIFFERENT field?" check, used inside the name/email/phone collection
+// steps themselves (handleGuestDetailCollection) so a reply like "my phone
+// number is also wrong" while being asked for the NAME is recognized as a
+// request to fix the phone instead of being saved as the literal name.
+// Deliberately conservative: only fires when the message both (a) mentions
+// a field other than the one currently being collected, AND (b) contains a
+// "wrong/incorrect" style indicator — a bare mention of the word "email" or
+// "phone" alone (e.g. as part of an actual name or address) is not enough.
+// ─────────────────────────────────────────────────────────────────────────
+function detectFieldRedirect(message, currentField) {
+  if (!WRONG_INDICATOR_REGEX.test(message)) return null;
+
+  const mentionsName = MENTIONS_NAME_FIELD_REGEX.test(message);
+  const mentionsEmail = MENTIONS_EMAIL_FIELD_REGEX.test(message);
+  const mentionsPhone = MENTIONS_PHONE_FIELD_REGEX.test(message);
+
+  if (currentField !== "email" && mentionsEmail) return "email";
+  if (currentField !== "phone" && mentionsPhone) return "phone";
+  if (currentField !== "fullName" && mentionsName) return "fullName";
+  return null;
+}
+
+// Task 2 — basic shape validation for a "full name" value, so obviously
+// non-name replies (a sentence about another field, a bare yes/no/okay, a
+// date, etc.) are never silently saved as the guest's name.
+const NON_NAME_EXACT_REGEX =
+  /^(yes|no|okay|ok|sure|nope|yeah|yep|correct|fine|wrong|incorrect)$/i;
+const NON_NAME_WORDS_REGEX =
+  /\b(is|are|the|my|wrong|incorrect|correct|actually|please|update|change|fix|not|also|too|number|email|phone)\b/i;
+
+function looksLikeName(text) {
+  const trimmed = (text || "").trim();
+  if (trimmed.length < 2 || trimmed.length > 60) return false;
+  if (NON_NAME_EXACT_REGEX.test(trimmed)) return false;
+  if (/\d/.test(trimmed)) return false;
+  if (NON_NAME_WORDS_REGEX.test(trimmed)) return false;
+  if (!/^[a-zA-Z][a-zA-Z'\-.\s]*$/.test(trimmed)) return false;
+  return true;
+}
+
+// Task 4 — detect a request to modify previously-searched booking
+// parameters (dates / adults) OUTSIDE of any active collection step, e.g.
+// "I want to change my dates.", "Check-in should be July 20.", "Adults
+// should be 4.", "Check-in July 20, checkout July 24, 3 adults."
+const MODIFY_BOOKING_WORDS_REGEX =
+  /\b(change (my |the )?dates?|different dates?|update (my |the )?dates?|check-?in should be|check-?out should be|checkout should be|adults? should be|make it \d+ adults?|please make it)\b/i;
 
 // Unsupported action requests (Problems 6-8): things the assistant has no
 // tool for at all. Detected deterministically so they never trigger the
@@ -701,12 +783,17 @@ function detectMentionedProperty(message, properties) {
 
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
-// Fixed: added an upper bound. E.164 numbers max out at 15 digits — without
-// this, garbage input like "+920000000000000000" (18 digits) was silently
-// accepted as a "valid" phone number.
+// Task 5 — phone numbers must include an international country code (a
+// leading "+"). Fixed: previously any 7-15 digit string was accepted with
+// no "+" requirement at all, so a hotel's outbound guest messages could
+// silently fail to deliver. E.164 numbers max out at 15 digits and a
+// country code implies at least 8 digits total (shortest real country code
+// + subscriber number combinations).
 function isValidPhone(input) {
-  const digits = (input || "").replace(/[^\d]/g, "");
-  return digits.length >= 7 && digits.length <= 15;
+  const trimmed = (input || "").trim();
+  if (!/^\+/.test(trimmed)) return false;
+  const digits = trimmed.replace(/[^\d]/g, "");
+  return digits.length >= 8 && digits.length <= 15;
 }
 
 function pad2(n) {
@@ -913,7 +1000,11 @@ async function parseDateSmart(input) {
 }
 
 const EMAIL_EXTRACT_REGEX = /[^\s@]+@[^\s@]+\.[^\s@]+/;
-const PHONE_EXTRACT_REGEX = /\+?\d[\d\s-]{6,}\d/;
+// Task 5 — a mandatory leading "+" is now required to extract a phone
+// number automatically (e.g. from a single-message booking). Fixed:
+// previously the "+" was optional here, so a bare local number with no
+// country code could be silently accepted from a combined message.
+const PHONE_EXTRACT_REGEX = /\+\d[\d\s-]{6,}\d/;
 const ADULTS_EXTRACT_REGEX =
   /\b(\d{1,2})\s*(adults?|guests?|people|persons?)\b/i;
 
@@ -1031,7 +1122,11 @@ function extractCorrectionFields(message) {
     // Fixed (Part 7): discard matches like "My full name is incorrect" where
     // the "name" captured is actually a description of the problem, not a
     // real new name — see NAME_FIELD_STOPWORDS above.
-    if (fullName.length >= 2 && !NAME_FIELD_STOPWORDS.has(firstWord)) {
+    if (
+      fullName.length >= 2 &&
+      !NAME_FIELD_STOPWORDS.has(firstWord) &&
+      looksLikeName(fullName)
+    ) {
       result.fullName = fullName;
     }
   }
@@ -1085,6 +1180,9 @@ function getOrCreateSession(sessionId, chatbotId) {
       actionFlowStep: null,
       pendingVerification: null,
       knownVerification: null,
+      // Task 4 — modification confirmation state.
+      awaitingModificationConfirm: false,
+      pendingModifiedSearchParams: null,
       createdAt: Date.now(),
     });
   }
@@ -1546,8 +1644,11 @@ The guest was just shown their reservation details and asked "Shall I proceed wi
 Read their reply below, in ANY language, and classify it as EXACTLY ONE of:
 YES, NO, CORRECTION_NAME, CORRECTION_EMAIL, CORRECTION_PHONE, CORRECTION_ALL, UNCLEAR
 
-- YES: any clear affirmative ("yes", "correct", "go ahead", "confirm", "sí", "ja", "haan", etc.)
-- NO: any clear negative / wants to cancel or stop.
+- YES: any clear affirmative ("yes", "yeah", "yep", "sure", "absolutely", "proceed", "continue",
+  "confirm", "book it", "do it", "go ahead", "that's correct", "looks good", "everything is
+  correct", "sí", "ja", "haan", etc.) — recognize the INTENT to proceed, not just the literal
+  word "yes".
+- NO: any clear negative / wants to cancel or stop / "wait" / "hold on" / "something is wrong".
 - CORRECTION_NAME / CORRECTION_EMAIL / CORRECTION_PHONE: the guest says ONE specific field is
   wrong and wants to fix it (e.g. "my email is wrong", "change the phone number").
 - CORRECTION_ALL: the guest says their details are wrong in general, without naming a single
@@ -2234,8 +2335,27 @@ async function handleGuestDetailCollection({
       });
     }
 
+    // Task 1/6 — the message might not be a new name at all, but a
+    // redirect to a DIFFERENT field ("My phone number is also wrong" while
+    // being asked for the name). Detect this BEFORE accepting raw text as
+    // the name, so it never gets silently saved as the literal fullName.
+    const redirectField = detectFieldRedirect(message, "fullName");
+    if (redirectField) {
+      logEvent(sessionId, "guest_detail_field_redirect", {
+        from: "name",
+        to: redirectField,
+      });
+      return send(getCorrectionAskSentence(redirectField), {
+        guestDetailStep: FIELD_TO_STEP[redirectField],
+        correctingField: true,
+      });
+    }
+
     const fullName = message.trim();
-    if (fullName.length < 2) return send(INVALID_NAME_SENTENCE);
+    // Task 2 — validate the value actually looks like a name before
+    // accepting it (rejects "My phone number is also wrong", "yes", "no",
+    // "okay", dates, etc.).
+    if (!looksLikeName(fullName)) return send(INVALID_NAME_SENTENCE);
 
     const details = { ...pending, fullName };
     if (session.correctingField) {
@@ -2283,6 +2403,21 @@ async function handleGuestDetailCollection({
           "email",
           session.correctingField,
         ),
+      });
+    }
+
+    // Task 1/6 — redirect to a different field if the guest is actually
+    // describing that OTHER field as wrong (e.g. "my phone is also wrong"
+    // while being asked for the email).
+    const redirectField = detectFieldRedirect(message, "email");
+    if (redirectField) {
+      logEvent(sessionId, "guest_detail_field_redirect", {
+        from: "email",
+        to: redirectField,
+      });
+      return send(getCorrectionAskSentence(redirectField), {
+        guestDetailStep: FIELD_TO_STEP[redirectField],
+        correctingField: true,
       });
     }
 
@@ -2336,7 +2471,24 @@ async function handleGuestDetailCollection({
       });
     }
 
+    // Task 1/6 — redirect to a different field if the guest is describing
+    // the NAME or EMAIL as wrong instead of supplying a phone number.
+    const redirectField = detectFieldRedirect(message, "phone");
+    if (redirectField) {
+      logEvent(sessionId, "guest_detail_field_redirect", {
+        from: "phone",
+        to: redirectField,
+      });
+      return send(getCorrectionAskSentence(redirectField), {
+        guestDetailStep: FIELD_TO_STEP[redirectField],
+        correctingField: true,
+      });
+    }
+
     const phone = message.trim();
+    // Task 5 — isValidPhone now also enforces a leading country code, so
+    // this single check covers both "not a phone number at all" and
+    // "phone number missing its country code".
     if (!isValidPhone(phone)) return send(INVALID_PHONE_SENTENCE);
 
     const details = { ...pending, phone };
@@ -2911,6 +3063,94 @@ async function handleActionFlow({ sessionId, message, session, property }) {
     actionFlowStep: "verifyPhone",
     pendingVerification: {},
   });
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+// Task 4 — modification confirmation flow. When the guest already has a
+// previous search (lastSearchParams) and, from an otherwise idle state,
+// sends a message that changes the dates or guest count, summarize the
+// proposed change and ask for confirmation BEFORE calling getOffers again.
+// ═════════════════════════════════════════════════════════════════════════
+const MODIFICATION_YES_REGEX =
+  /\b(yes|yeah|yep|sure|confirm|go ahead|proceed|do it|correct|looks good)\b/i;
+const MODIFICATION_NO_REGEX =
+  /\b(no|nope|wait|hold on|cancel|don'?t|stop)\b/i;
+
+function detectBookingModification(message) {
+  if (!MODIFY_BOOKING_WORDS_REGEX.test(message)) {
+    // Even without an explicit "change my dates" phrase, a message that
+    // plainly contains new dates and/or a new adult count (and nothing
+    // else suggesting a brand-new, unrelated booking) is treated as a
+    // modification, per Task 4's examples ("Check-in July 20, checkout
+    // July 24, 3 adults.").
+    const extracted = extractQuickBookingDetails(message);
+    if (extracted.arrival || extracted.departure || extracted.adults) {
+      return extracted;
+    }
+    return null;
+  }
+  return extractQuickBookingDetails(message);
+}
+
+async function handleModificationConfirmation({
+  sessionId,
+  message,
+  session,
+  property,
+}) {
+  const lang = session.lastKnownLanguage || "English";
+  const pending = session.pendingModifiedSearchParams || {};
+
+  const send = async (fixedText, extraUpdates = {}) => {
+    const translated = await translateToLanguage(fixedText, lang);
+    const newHistory = [
+      ...session.history,
+      { role: "user", content: message },
+      { role: "assistant", content: translated },
+    ];
+    updateSession(sessionId, { history: newHistory, ...extraUpdates });
+    return reply("text", { text: translated });
+  };
+
+  // The guest might refine the change further before confirming (e.g.
+  // "actually make it 4 adults") — merge any newly-mentioned fields in.
+  const refinement = extractQuickBookingDetails(message);
+  const hasRefinement = Boolean(
+    refinement.arrival || refinement.departure || refinement.adults,
+  );
+  if (hasRefinement && !MODIFICATION_YES_REGEX.test(message)) {
+    const merged = { ...pending, ...refinement };
+    return send(buildModificationConfirmationText(merged), {
+      pendingModifiedSearchParams: merged,
+      awaitingModificationConfirm: true,
+    });
+  }
+
+  if (MODIFICATION_YES_REGEX.test(message)) {
+    const merged = { ...session.lastSearchParams, ...pending };
+    updateSession(sessionId, {
+      awaitingModificationConfirm: false,
+      pendingModifiedSearchParams: null,
+    });
+    return await presentOffersOrAutoSelect({
+      sessionId,
+      session: sessions.get(sessionId),
+      property,
+      params: merged,
+      lang,
+      message,
+      autoCheapest: CHEAPEST_REGEX.test(message),
+    });
+  }
+
+  if (MODIFICATION_NO_REGEX.test(message)) {
+    return send(
+      "No problem, I'll keep your existing dates and guest count.",
+      { awaitingModificationConfirm: false, pendingModifiedSearchParams: null },
+    );
+  }
+
+  return send(buildModificationConfirmationText(pending));
 }
 
 // ─── Shared: run the tool-calling loop and persist history ─────────────────
@@ -3549,6 +3789,37 @@ async function handleWithProperties({
     return reply("text", { text });
   }
 
+  // Task 3 — room change/upgrade requests for an EXISTING assignment have
+  // no supporting tool at all. Only handle this here, deterministically,
+  // when there's no active booking-related step in progress — inside an
+  // active flow, "another room" / "different room" phrasing already means
+  // something more specific (switching the currently-selected OFFER, see
+  // CHANGE_OFFER_MIDFLOW_REGEX / WANTS_ANOTHER_ROOM_REGEX) and must keep
+  // being handled by those existing paths.
+  const inActiveBookingFlow = Boolean(
+    currentSession.guestDetailStep ||
+      currentSession.searchDetailStep ||
+      currentSession.actionFlowStep ||
+      currentSession.awaitingModificationConfirm ||
+      (currentSession.lastOffers && currentSession.lastOffers.length > 0 && !currentSession.selectedOffer),
+  );
+  if (!inActiveBookingFlow && ROOM_CHANGE_REQUEST_REGEX.test(message)) {
+    logEvent(sessionId, "room_change_request_refused", {});
+    const lang = currentSession.lastKnownLanguage || "English";
+    const text = await translateToLanguage(
+      ROOM_CHANGE_UNSUPPORTED_SENTENCE,
+      lang,
+    );
+    updateSession(sessionId, {
+      history: [
+        ...currentSession.history,
+        { role: "user", content: message },
+        { role: "assistant", content: text },
+      ],
+    });
+    return reply("text", { text });
+  }
+
   const mentioned = detectMentionedProperty(message, properties);
   const effectiveProperty =
     mentioned ||
@@ -3691,6 +3962,18 @@ async function handleWithProperties({
     });
   }
 
+  // Task 4 — a modification confirmation is pending; resolve it before any
+  // other routing (offer selection, intent analysis, etc.).
+  if (currentSession.awaitingModificationConfirm) {
+    logEvent(sessionId, "route", { branch: "modification_confirmation" });
+    return await handleModificationConfirmation({
+      sessionId,
+      message,
+      session: currentSession,
+      property: effectiveProperty,
+    });
+  }
+
   const offerSelection = currentSession.lastOffers
     ? await resolveOfferSelection(message, currentSession.lastOffers)
     : null;
@@ -3721,6 +4004,42 @@ async function handleWithProperties({
       offer: offerSelection.offer,
       lang,
     });
+  }
+
+  // Task 4 — the guest is idle (no active step, no offer list pending
+  // selection) but already has a completed search from earlier in this
+  // conversation, and the new message looks like a request to change the
+  // dates or guest count. Summarize the change and ask for confirmation
+  // before calling getOffers again, instead of silently re-searching.
+  if (
+    currentSession.lastSearchParams &&
+    !currentSession.awaitingHotelForBooking &&
+    !currentSession.awaitingHotelForAction
+  ) {
+    const modification = detectBookingModification(message);
+    if (modification) {
+      logEvent(sessionId, "route", { branch: "modification_detected" });
+      const merged = { ...currentSession.lastSearchParams, ...modification };
+      delete merged.wantsCheapest;
+      delete merged.email;
+      delete merged.phone;
+      delete merged.fullName;
+      const lang = currentSession.lastKnownLanguage || "English";
+      const text = await translateToLanguage(
+        buildModificationConfirmationText(modification),
+        lang,
+      );
+      updateSession(sessionId, {
+        awaitingModificationConfirm: true,
+        pendingModifiedSearchParams: modification,
+        history: [
+          ...currentSession.history,
+          { role: "user", content: message },
+          { role: "assistant", content: text },
+        ],
+      });
+      return reply("text", { text });
+    }
   }
 
   const regexHint = regexIntentHint(message);
