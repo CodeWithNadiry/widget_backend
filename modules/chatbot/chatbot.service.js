@@ -263,7 +263,7 @@ const NO_CONTEXT_SENTENCES = {
 
 // ─── Fixed sentences used by deterministic flows ───────────────────────────
 const BOOKING_CONFIRMED_SENTENCE =
-  "Booking confirmed. Please check your email for the confirmation.";
+  "Booking confirmed. Please check your email for confirmation.";
 
 const PASSCODE_REFUSAL_SENTENCE =
   "For security reasons, I'm not able to share room passcodes here. Please contact the front desk directly for that.";
