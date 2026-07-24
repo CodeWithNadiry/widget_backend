@@ -4,6 +4,7 @@ import adminRoutes from "../modules/admin/admin.route.js";
 import chatbotRoutes from "../modules/chatbot/chatbot.route.js";
 import propertyRoutes from "../modules/property/property.route.js";
 import documentRoutes from "../modules/document/document.route.js";
+import userRoutes from "../modules/user/user.route.js";
 
 const router = Router();
 
@@ -12,5 +13,6 @@ router.use("/admin/chatbots", adminRoutes);
 router.use("/chatbot", chatbotRoutes);
 router.use("/property", propertyRoutes);
 router.use("/document", documentRoutes);  
+router.use('/admin/users', userRoutes)
 
 export default router;

@@ -5,6 +5,7 @@ import routes from './routes/index.js'
 import { connectDB } from "./db/client.js";
 import { initModels } from "./models/index.js";
 import { errorHandler } from "./middleware/errorHandler.js";
+import { bootstrapAdmin } from "./lib/bootstrapAdmin.js";
 
 config(); // loads .env
 
@@ -24,7 +25,6 @@ app.use(cors({
 
 app.use(express.json());
 
-console.log('app running in full')
 // Routes
 app.use('/', routes)
 
@@ -37,7 +37,9 @@ const start = async () => {
 
   initModels();
 
-  const PORT = process.env.PORT || 8080;
+  await bootstrapAdmin();
+
+  const PORT = process.env.PORT || 8081;
 
   app.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);

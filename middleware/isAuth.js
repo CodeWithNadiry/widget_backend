@@ -20,6 +20,9 @@ export function isAuth(req, res, next) {
 
     req.userId = decodedToken.userId;
     req.userEmail = decodedToken.email;
+    // Role is embedded in the token at login time (see auth.service.js) so
+    // isAdmin doesn't need a DB round-trip on every request.
+    req.userRole = decodedToken.role;
 
     next();
   } catch (error) {

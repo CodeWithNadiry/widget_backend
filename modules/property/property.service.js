@@ -47,7 +47,18 @@ export const propertyService = {
       throw new NotFoundError("Property not found.");
     }
 
-    return property;
+    // Properties are enforced single-chatbot (see admin.service.js
+    // assignProperty), so there's at most one row here. Looked up directly
+    // against the join table rather than via a Sequelize association, so
+    // this doesn't depend on an association/alias being set up correctly.
+    const assignment = await ChatbotProperties.findOne({
+      where: { propertyId },
+    });
+
+    return {
+      ...property.toJSON(),
+      chatbotId: assignment?.chatbotId ?? null,
+    };
   },
 
   async updateProperty({ propertyId, userId, updates }) {
@@ -87,17 +98,9 @@ export const propertyService = {
       throw new NotFoundError("Property not found.");
     }
 
-    // check if this property is still assigned to any chatbot
-    const assignmentCount = await ChatbotProperties.count({
-      where: { propertyId },
-    });
-
-    if (assignmentCount > 0) {
-      throw new AppError(
-        "Cannot delete a property that is still assigned to one or more chatbots. Remove it from all chatbots first.",
-        409,
-      );
-    }
+    // Deleting a property is a full delete — clear any chatbot
+    // assignment(s) first instead of blocking on them.
+    await ChatbotProperties.destroy({ where: { propertyId } });
 
     await property.destroy();
   },

@@ -35,7 +35,7 @@ export const adminService = {
   async getChatbotById({ chatbotId, userId }) {
     const chatbot = await Chatbot.findOne({
       where: { chatbotId, createdBy: userId },
-      attributes: ["chatbotId", "name", "slug", "systemPrompt", "theme"],
+      attributes: ["chatbotId", "name", "slug", "systemPrompt", "theme", "logoUrl"],
     });
     if (!chatbot) throw new NotFoundError("Chatbot not found.");
     return chatbot;
@@ -60,6 +60,7 @@ export const adminService = {
         slug: chatbot.slug,
         systemPrompt: chatbot.systemPrompt,
         theme: chatbot.theme,  // ✅ return theme
+        logoUrl: chatbot.logoUrl,
       },
     };
   },
@@ -95,13 +96,10 @@ export const adminService = {
       throw new NotFoundError("Property not found.");
     }
 
-    const alreadyAssigned = await ChatbotProperties.findOne({
-      where: { chatbotId, propertyId },
-    });
-
-    if (alreadyAssigned) {
-      throw new AppError("This property is already assigned to the chatbot.", 409);
-    }
+    // Enforce one-chatbot-per-property: wipe any existing assignment for
+    // this property (whichever chatbot it belongs to, including this one)
+    // before creating the new link. This makes "assign" double as "move".
+    await ChatbotProperties.destroy({ where: { propertyId } });
 
     await ChatbotProperties.create({ chatbotId, propertyId });
   },

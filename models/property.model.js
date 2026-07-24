@@ -30,6 +30,12 @@ const Property = sequelize.define('property', {
     allowNull: true   // encrypted, used for X-API-Key header
   },
 
+  imageUrl: {
+    type: DataTypes.STRING,
+    allowNull: true,
+    validate: { isUrl: { msg: "imageUrl must be a valid URL" } },
+  },
+
   createdBy: {
   type: DataTypes.UUID,
   allowNull: false,

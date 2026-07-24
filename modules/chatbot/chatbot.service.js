@@ -980,13 +980,35 @@ If the message does not contain any understandable guest count at all, reply wit
   }
 }
 
-async function parseDateSmart(input) {
-  const fast = tryParseDateFast(input);
+// FIX (Bug 1): when the guest gives the check-out date as a bare day number
+// (e.g. "16") right after an arrival date, resolve it in the SAME month/year
+// as the arrival date rather than relative to "today". This is what lets a
+// genuinely invalid pair like arrival "18" / departure "16" come back as the
+// same month (16th before 18th) so the existing departure<=arrival check can
+// actually catch it, instead of the two dates silently rolling into
+// different months or years and the comparison passing by accident.
+
+function resolveDepartureDayRelativeToArrival(message, arrivalStr) {
+  const trimmed = (message || "").trim();
+  const m = trimmed.match(/^(\d{1,2})(?:st|nd|rd|th)?$/);
+  if (!m || !arrivalStr) return null;
+  const day = Number(m[1]);
+  const match = arrivalStr.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!match) return null;
+  const [, y, mo] = match.map((v, i) => (i === 0 ? v : Number(v)));
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  if (!isRealDate(year, month, day)) return null;
+  return `${year}-${pad2(month)}-${pad2(day)}`;
+}
+
+async function parseDateSmart(input, referenceDate = new Date()) {
+  const fast = tryParseDateFast(input, referenceDate);
   if (fast) return fast;
   try {
-    const today = new Date().toISOString().slice(0, 10);
+    const anchor = referenceDate.toISOString().slice(0, 10);
     const res = await chatWithTools({
-      systemPrompt: `Today's date is ${today}. The guest just answered a request for a date, in any language or format (e.g. "5th July", "next Monday", "05.07.2026"). Convert their reply to strict YYYY-MM-DD format. Reply with ONLY the date in that exact format, or exactly "NONE" if it cannot be understood as a date at all.`,
+      systemPrompt: `Today's date is ${anchor}. The guest just answered a request for a date, in any language or format (e.g. "5th July", "next Monday", "05.07.2026"). Convert their reply to strict YYYY-MM-DD format. Reply with ONLY the date in that exact format, or exactly "NONE" if it cannot be understood as a date at all.`,
       history: [{ role: "user", content: input }],
       tools: [],
       model: UTILITY_MODEL,
@@ -1012,8 +1034,15 @@ const ADULTS_EXTRACT_REGEX =
 // "name" and "is", so a typo/no-space reply like "nameis usman" never
 // matched. Changed the middle group to `[:\s]*` (zero-or-more) so it still
 // catches the common typo'd form without loosening the other alternatives.
+//
+// FIX (Bug 3): also now matches "change my name to X" / "update my name to
+// X" / "correct my name to X" — previously only "my name is X" / "I'm X" /
+// "this is X" style phrasing was recognized, so a correction like "no
+// change my name to usman nadiry" never had the new name extracted, and
+// the flow fell back to asking "what's the correct full name?" even though
+// the guest had already given it in the same message.
 const NAME_EXTRACT_REGEX =
-  /\b(?:my (?:full )?name is|name[:\s]*is|i'?m|this is)\s+([a-zA-Z][a-zA-Z'\-]*(?:\s+[a-zA-Z][a-zA-Z'\-]*){0,3})/i;
+  /\b(?:my (?:full )?name is|name[:\s]*is|i'?m|this is|change (?:my )?(?:full )?name to|update (?:my )?(?:full )?name to|correct (?:my )?(?:full )?name to)\s+([a-zA-Z][a-zA-Z'\-]*(?:\s+[a-zA-Z][a-zA-Z'\-]*){0,3})/i;
 
 // Fixed (Part 7): NAME_EXTRACT_REGEX matches "my full name is <word>" for ANY
 // following word — so "My full name is incorrect." was being parsed as a
@@ -1874,7 +1903,14 @@ async function presentOffersOrAutoSelect({
   if (!result?.offers || result.offers.length === 0) {
     logEvent(sessionId, "get_offers_empty", { property: property?.name });
     const text = await translateToLanguage(NO_ROOMS_SENTENCE, lang);
+    // FIX (Bug 2): persist lastSearchParams even when no rooms are found.
+    // Previously this was only set on a successful search, so a follow-up
+    // message giving NEW dates (e.g. "check in is 18 and checkout is 19")
+    // had no lastSearchParams to modify, fell through to being classified
+    // as a brand-new booking request, and — per the hotel-reconfirmation
+    // rule — re-asked which hotel even though it was already confirmed.
     updateSession(sessionId, {
+      lastSearchParams: params,
       history: [
         ...session.history,
         { role: "user", content: message },
@@ -2140,7 +2176,21 @@ async function handleSearchDetailCollection({
   }
 
   if (step === "departure") {
-    const departure = await parseDateSmart(message);
+    // FIX (Bug 1): resolve a bare day number (e.g. "16") in the SAME
+    // month/year as the arrival date first, instead of parsing it against
+    // "today". This is what makes an invalid pair like arrival "18" /
+    // departure "16" actually land in the same month so the check below
+    // can catch it, rather than each date rolling independently into
+    // different months/years and the comparison passing by accident.
+    let departure = pending.arrival
+      ? resolveDepartureDayRelativeToArrival(message, pending.arrival)
+      : null;
+    if (!departure) {
+      const referenceForDeparture = pending.arrival
+        ? new Date(pending.arrival)
+        : new Date();
+      departure = await parseDateSmart(message, referenceForDeparture);
+    }
     if (!departure) return send(INVALID_DATE_SENTENCE);
     if (pending.arrival && new Date(departure) <= new Date(pending.arrival)) {
       return send(INVALID_DEPARTURE_SENTENCE);
@@ -2652,7 +2702,7 @@ async function handleGuestDetailCollection({
         property,
       });
 
-      if (!result || result.success === false) {
+      if (result.success === false) {
         logEvent(sessionId, "booking_failed", { error: result?.error });
         return send(BOOKING_FAILED_SENTENCE, { guestDetailStep: "confirm" });
       }

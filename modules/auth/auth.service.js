@@ -7,9 +7,12 @@ import { configData } from "../../config/config.js";
 const { jwtSecretKey, jwtExpiresIn } = configData;
 
 export const authService = {
-  async signupUser(data) {
-    const { name, email, password } = data;
-
+  // Kept for internal use only (the bootstrap script and the admin-only
+  // user-creation endpoint both call this) — there is no public route that
+  // reaches it anymore. Callers control role/isActive explicitly; this
+  // function itself doesn't decide either, to keep the "only the bootstrap
+  // creates an admin" rule enforced at the call sites, not buried here.
+  async signupUser({ name, email, password, role = "user", isActive = false }) {
     const existingUser = await User.findOne({ where: { email } });
 
     if (existingUser) {
@@ -22,6 +25,8 @@ export const authService = {
       name,
       email,
       password: hashedPWD,
+      role,
+      isActive,
     });
 
     return {
@@ -29,6 +34,8 @@ export const authService = {
         userId: user.userId,
         name: user.name,
         email: user.email,
+        role: user.role,
+        isActive: user.isActive,
       },
     };
   },
@@ -48,10 +55,18 @@ export const authService = {
       throw new UnauthorizedError("Invalid credentials.");
     }
 
+    if (!user.isActive) {
+      throw new AppError(
+        "Your account is inactive. Contact your admin to have it activated.",
+        403,
+      );
+    }
+
     const token = jwt.sign(
       {
         userId: user.userId,
         email: user.email,
+        role: user.role,
       },
       jwtSecretKey,
       { expiresIn: jwtExpiresIn }
@@ -63,6 +78,7 @@ export const authService = {
         userId: user.userId,
         name: user.name,
         email: user.email,
+        role: user.role,
       },
     };
   },
